@@ -1,0 +1,33 @@
+# Bazel
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-gpucompute
+.bazelcache/
+
+# C++ build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# SPIR-V compiled shaders
+*.spv
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Local configuration
+.env
+.env.local
