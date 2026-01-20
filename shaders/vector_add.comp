@@ -8,5 +8,5 @@ layout(binding = 2) writeonly buffer Output { float c[]; };
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    c[idx] = a[idx] + b[idx];
+    c[idx] = a[idx] / (b[idx] + 0.001);
 }

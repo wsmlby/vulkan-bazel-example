@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
+#include <chrono>
+#include <iostream>
 
 namespace vkcompute {
 
@@ -175,7 +177,6 @@ public:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
-
     ComputePipeline() = default;
     ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount)
         : ctx(&context) {
@@ -191,8 +192,12 @@ public:
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = code.size() * 4;
         moduleInfo.pCode = code.data();
+        auto compileStart = std::chrono::high_resolution_clock::now();
         check(vkCreateShaderModule(ctx->device, &moduleInfo, nullptr, &shaderModule),
               "Failed to create shader module");
+        auto compileEnd = std::chrono::high_resolution_clock::now();
+        double compileTimeMs = std::chrono::duration<double, std::milli>(compileEnd - compileStart).count();
+        std::cout << "Shader compile time: " << compileTimeMs << " ms" << std::endl;
 
         // Descriptor layout - N storage buffers
         std::vector<VkDescriptorSetLayoutBinding> bindings(bufferCount);

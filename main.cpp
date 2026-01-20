@@ -79,7 +79,7 @@ int main() {
         // Verify results
         bool success = true;
         for (uint32_t i = 0; i < N; i++) {
-            float expected = hostA[i] + hostB[i];
+            float expected = hostA[i] / (hostB[i] + 0.001f);  // Match shader operation
             if (std::fabs(hostC[i] - expected) > 1e-5f) {
                 std::cerr << "Mismatch at " << i << ": " << hostC[i]
                           << " != " << expected << "\n";

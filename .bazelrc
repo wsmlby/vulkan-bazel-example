@@ -1,2 +1,5 @@
 build --cxxopt=-std=c++17
 build --cxxopt=-Wall
+
+# Enable WORKSPACE for external dependencies (required for Bazel 8+)
+common --enable_workspace
