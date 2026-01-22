@@ -14,17 +14,26 @@ filegroup(
     srcs = [":vector_add_shader"],
 )
 
-cc_binary(
-    name = "gpu_compute",
+
+cc_library(
+    name = "vk_compute",
     srcs = [
-        "main.cpp",
+        "vk_compute.cpp",
         "vk_compute.hpp",
     ],
-    data = [":shaders"],
+    deps = ["@vulkan_headers//:vulkan_headers"],
     linkopts = [
         "-l:libvulkan.so.1",
         "-ldl",
         "-lpthread",
     ],
-    deps = ["@vulkan_headers//:vulkan_headers"],
+)
+
+cc_binary(
+    name = "gpu_compute",
+    srcs = [
+        "main.cpp",
+    ],
+    data = [":shaders"],
+    deps = [":vk_compute"],
 )

@@ -33,12 +33,13 @@ std::string findShaderPath(const std::string& shaderName) {
     throw std::runtime_error("Shader not found: " + shaderName);
 }
 
-int main() {
+int main(int argc, char** argv) {
     using namespace vkcompute;
 
     try {
         // Initialize Vulkan compute context
-        Context ctx;
+        std::string filter = (argc > 1) ? argv[1] : "";
+        Context ctx(filter);
         std::cout << "Using device: " << ctx.deviceName() << "\n";
 
         // Data size
