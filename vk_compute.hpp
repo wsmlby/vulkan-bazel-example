@@ -18,11 +18,16 @@ public:
     uint32_t queueFamily = 0;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps;
+    
+    // Reusable transfer resources
+    VkCommandBuffer transferCmd = VK_NULL_HANDLE;
+    VkFence transferFence = VK_NULL_HANDLE;
 
     Context(const std::string& preferredDevice = "");
     ~Context();
 
     std::string deviceName() const;
+    void printLimits() const;  // Print device limits including allocation count
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 };
 
@@ -62,7 +67,6 @@ public:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
     ComputePipeline() = default;
     ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount);
@@ -76,9 +80,6 @@ public:
     void recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
     
     static void barrier(VkCommandBuffer cmd);
-
-    // Helper for single-shot dispatch (internally manages a command buffer)
-    void dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
 };
 
 class Sequence {
@@ -95,7 +96,7 @@ public:
     void submit(); // Submit and wait
     double submitAndWait(); // Returns execution time in ms
 
-    void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1, bool autoBarrier = true);
+    void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
     void barrier();
 };
 

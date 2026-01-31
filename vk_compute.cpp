@@ -90,10 +90,23 @@ Context::Context(const std::string& preferredDevice) {
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.queueFamilyIndex = queueFamily;
     check(vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool), "Failed to create command pool");
+    
+    // Allocate reusable transfer command buffer
+    VkCommandBufferAllocateInfo cmdAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cmdAllocInfo.commandPool = cmdPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(device, &cmdAllocInfo, &transferCmd), "Failed to allocate transfer cmd buffer");
+    
+    // Create reusable transfer fence
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    check(vkCreateFence(device, &fenceInfo, nullptr, &transferFence), "Failed to create transfer fence");
 }
 
 Context::~Context() {
     if (device) {
+        if (transferFence) vkDestroyFence(device, transferFence, nullptr);
+        if (transferCmd) vkFreeCommandBuffers(device, cmdPool, 1, &transferCmd);
         vkDestroyCommandPool(device, cmdPool, nullptr);
         vkDestroyDevice(device, nullptr);
     }
@@ -104,6 +117,21 @@ std::string Context::deviceName() const {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physicalDevice, &props);
     return props.deviceName;
+}
+
+void Context::printLimits() const {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physicalDevice, &props);
+    
+    std::cout << "Device: " << props.deviceName << "\n";
+    std::cout << "Max memory allocations: " << props.limits.maxMemoryAllocationCount << "\n";
+    std::cout << "Max buffer size: " << (props.limits.maxStorageBufferRange / 1024 / 1024) << " MB\n";
+    std::cout << "Max compute shared memory: " << (props.limits.maxComputeSharedMemorySize / 1024) << " KB\n";
+    std::cout << "Max workgroup invocations: " << props.limits.maxComputeWorkGroupInvocations << "\n";
+    std::cout << "Max workgroup size: [" 
+              << props.limits.maxComputeWorkGroupSize[0] << ", "
+              << props.limits.maxComputeWorkGroupSize[1] << ", "
+              << props.limits.maxComputeWorkGroupSize[2] << "]\n";
 }
 
 uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const {
@@ -189,34 +217,30 @@ void Buffer::download(void* data, VkDeviceSize dataSize) {
 void Buffer::copyFrom(const Buffer& src, VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize copySize) {
     if (copySize == VK_WHOLE_SIZE) copySize = src.size;
 
-    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = ctx->cmdPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmdBuf;
-    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmdBuf), "Failed to allocate cmd buffer");
+    // Reset and reuse the context's transfer command buffer
+    vkResetCommandBuffer(ctx->transferCmd, 0);
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmdBuf, &beginInfo);
+    vkBeginCommandBuffer(ctx->transferCmd, &beginInfo);
 
     VkBufferCopy copyRegion{};
     copyRegion.srcOffset = srcOffset;
     copyRegion.dstOffset = dstOffset;
     copyRegion.size = copySize;
-    vkCmdCopyBuffer(cmdBuf, src.buffer, buffer, 1, &copyRegion);
+    vkCmdCopyBuffer(ctx->transferCmd, src.buffer, buffer, 1, &copyRegion);
 
-    vkEndCommandBuffer(cmdBuf);
+    vkEndCommandBuffer(ctx->transferCmd);
+
+    // Reset and use the context's transfer fence
+    vkResetFences(ctx->device, 1, &ctx->transferFence);
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmdBuf;
+    submitInfo.pCommandBuffers = &ctx->transferCmd;
 
-    vkQueueSubmit(ctx->queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(ctx->queue);
-
-    vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmdBuf);
+    vkQueueSubmit(ctx->queue, 1, &submitInfo, ctx->transferFence);
+    vkWaitForFences(ctx->device, 1, &ctx->transferFence, VK_TRUE, UINT64_MAX);
 }
 
 Buffer createDeviceBuffer(Context& ctx, VkDeviceSize size) {
@@ -302,18 +326,10 @@ ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, u
     check(vkAllocateDescriptorSets(ctx->device, &allocInfo, &descSet),
           "Failed to allocate descriptor set");
 
-    // Allocate command buffer once
-    VkCommandBufferAllocateInfo cmdAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cmdAllocInfo.commandPool = ctx->cmdPool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-    check(vkAllocateCommandBuffers(ctx->device, &cmdAllocInfo, &commandBuffer),
-          "Failed to allocate command buffer");
 }
 
 ComputePipeline::~ComputePipeline() {
     if (ctx && ctx->device) {
-        if (commandBuffer) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &commandBuffer);
         vkDestroyPipeline(ctx->device, pipeline, nullptr);
         vkDestroyPipelineLayout(ctx->device, pipelineLayout, nullptr);
         vkDestroyDescriptorPool(ctx->device, descPool, nullptr);
@@ -368,31 +384,6 @@ void ComputePipeline::barrier(VkCommandBuffer cmd) {
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void ComputePipeline::dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
-    vkResetCommandBuffer(commandBuffer, 0);
-
-    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-    recordTo(commandBuffer, groupCountX, groupCountY, groupCountZ);
-
-    vkEndCommandBuffer(commandBuffer);
-
-    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
-
-    VkFence fence;
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(ctx->device, &fenceInfo, nullptr, &fence);
-
-    vkQueueSubmit(ctx->queue, 1, &submitInfo, fence);
-    vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX);
-
-    vkDestroyFence(ctx->device, fence, nullptr);
-}
-
 Sequence::Sequence(Context& context) : ctx(&context) {
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = ctx->cmdPool;
@@ -441,11 +432,8 @@ double Sequence::submitAndWait() {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-void Sequence::record(ComputePipeline& pipeline, uint32_t x, uint32_t y, uint32_t z, bool autoBarrier) {
+void Sequence::record(ComputePipeline& pipeline, uint32_t x, uint32_t y, uint32_t z) {
     pipeline.recordTo(cmd, x, y, z);
-    if (autoBarrier) {
-        ComputePipeline::barrier(cmd);
-    }
 }
 
 void Sequence::barrier() {

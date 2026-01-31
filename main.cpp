@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
         std::string filter = (argc > 1) ? argv[1] : "";
         Context ctx(filter);
         std::cout << "Using device: " << ctx.deviceName() << "\n";
+        ctx.printLimits();
 
         // Data size
         const uint32_t N = 1024 * 1024 * 20;  // 1M elements
@@ -90,7 +91,9 @@ int main(int argc, char** argv) {
         const int iterations = 10000;
         for (int i = 0; i < iterations; i++) {
             seq.record(pipeline, numGroups);
+            seq.barrier();
             seq.record(pipeline2, numGroups);
+            seq.barrier();
         }
         seq.end();
 
