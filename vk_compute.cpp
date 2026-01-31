@@ -116,7 +116,7 @@ uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props)
 }
 
 Buffer::Buffer(Context& context, VkDeviceSize bufferSize, VkBufferUsageFlags usage,
-               VkMemoryPropertyFlags memProps) : size(bufferSize), ctx(&context) {
+               VkMemoryPropertyFlags memProps) : size(bufferSize), propertyFlags(memProps), ctx(&context) {
 
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufferInfo.size = size;
@@ -132,17 +132,22 @@ Buffer::Buffer(Context& context, VkDeviceSize bufferSize, VkBufferUsageFlags usa
     allocInfo.memoryTypeIndex = ctx->findMemoryType(memReq.memoryTypeBits, memProps);
     check(vkAllocateMemory(ctx->device, &allocInfo, nullptr, &memory), "Failed to allocate memory");
     check(vkBindBufferMemory(ctx->device, buffer, memory, 0), "Failed to bind buffer memory");
+
+    if (propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        check(vkMapMemory(ctx->device, memory, 0, size, 0, &mapped), "Failed to map memory");
+    }
 }
 
 Buffer::~Buffer() {
     if (ctx && ctx->device) {
+        if (mapped) vkUnmapMemory(ctx->device, memory);
         vkDestroyBuffer(ctx->device, buffer, nullptr);
         vkFreeMemory(ctx->device, memory, nullptr);
     }
 }
 
-Buffer::Buffer(Buffer&& o) noexcept : buffer(o.buffer), memory(o.memory), size(o.size), ctx(o.ctx) {
-    o.buffer = VK_NULL_HANDLE; o.memory = VK_NULL_HANDLE; o.ctx = nullptr;
+Buffer::Buffer(Buffer&& o) noexcept : buffer(o.buffer), memory(o.memory), size(o.size), propertyFlags(o.propertyFlags), mapped(o.mapped), ctx(o.ctx) {
+    o.buffer = VK_NULL_HANDLE; o.memory = VK_NULL_HANDLE; o.mapped = nullptr; o.ctx = nullptr;
 }
 
 Buffer& Buffer::operator=(Buffer&& o) noexcept {
@@ -150,27 +155,79 @@ Buffer& Buffer::operator=(Buffer&& o) noexcept {
         std::swap(buffer, o.buffer); 
         std::swap(memory, o.memory);
         std::swap(size, o.size); 
+        std::swap(propertyFlags, o.propertyFlags);
+        std::swap(mapped, o.mapped);
         std::swap(ctx, o.ctx); 
     }
     return *this;
 }
 
 void Buffer::upload(const void* data, VkDeviceSize dataSize) {
-    void* mapped;
-    check(vkMapMemory(ctx->device, memory, 0, dataSize, 0, &mapped), "Failed to map memory");
-    memcpy(mapped, data, dataSize);
-    vkUnmapMemory(ctx->device, memory);
+    if (mapped) {
+        memcpy(mapped, data, dataSize);
+    } else {
+        Buffer staging(*ctx, dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        memcpy(staging.mapped, data, dataSize);
+        copyFrom(staging, 0, 0, dataSize);
+    }
 }
 
 void Buffer::download(void* data, VkDeviceSize dataSize) {
-    void* mapped;
-    check(vkMapMemory(ctx->device, memory, 0, dataSize, 0, &mapped), "Failed to map memory");
-    memcpy(data, mapped, dataSize);
-    vkUnmapMemory(ctx->device, memory);
+    if (mapped) {
+        memcpy(data, mapped, dataSize);
+    } else {
+        Buffer staging(*ctx, dataSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        staging.copyFrom(*this, 0, 0, dataSize);
+        memcpy(data, staging.mapped, dataSize);
+    }
+}
+
+void Buffer::copyFrom(const Buffer& src, VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize copySize) {
+    if (copySize == VK_WHOLE_SIZE) copySize = src.size;
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = ctx->cmdPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmdBuf;
+    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmdBuf), "Failed to allocate cmd buffer");
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmdBuf, &beginInfo);
+
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = srcOffset;
+    copyRegion.dstOffset = dstOffset;
+    copyRegion.size = copySize;
+    vkCmdCopyBuffer(cmdBuf, src.buffer, buffer, 1, &copyRegion);
+
+    vkEndCommandBuffer(cmdBuf);
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmdBuf;
+
+    vkQueueSubmit(ctx->queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(ctx->queue);
+
+    vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmdBuf);
 }
 
 Buffer createDeviceBuffer(Context& ctx, VkDeviceSize size) {
-    return Buffer(ctx, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    return Buffer(ctx, size, 
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+Buffer createPinnedBuffer(Context& ctx, VkDeviceSize size) {
+    return Buffer(ctx, size, 
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
@@ -244,10 +301,19 @@ ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, u
     allocInfo.pSetLayouts = &descLayout;
     check(vkAllocateDescriptorSets(ctx->device, &allocInfo, &descSet),
           "Failed to allocate descriptor set");
+
+    // Allocate command buffer once
+    VkCommandBufferAllocateInfo cmdAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cmdAllocInfo.commandPool = ctx->cmdPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(ctx->device, &cmdAllocInfo, &commandBuffer),
+          "Failed to allocate command buffer");
 }
 
 ComputePipeline::~ComputePipeline() {
     if (ctx && ctx->device) {
+        if (commandBuffer) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &commandBuffer);
         vkDestroyPipeline(ctx->device, pipeline, nullptr);
         vkDestroyPipelineLayout(ctx->device, pipelineLayout, nullptr);
         vkDestroyDescriptorPool(ctx->device, descPool, nullptr);
@@ -285,30 +351,37 @@ void ComputePipeline::bindBuffers(const std::vector<Buffer*>& buffers) {
                            writes.data(), 0, nullptr);
 }
 
-void ComputePipeline::dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
-    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = ctx->cmdPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
+void ComputePipeline::recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout,
+                            0, 1, &descSet, 0, nullptr);
+    vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
+}
 
-    VkCommandBuffer cmdBuf;
-    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmdBuf),
-          "Failed to allocate command buffer");
+void ComputePipeline::barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, 
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+void ComputePipeline::dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
+    vkResetCommandBuffer(commandBuffer, 0);
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmdBuf, &beginInfo);
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-    vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout,
-                            0, 1, &descSet, 0, nullptr);
-    vkCmdDispatch(cmdBuf, groupCountX, groupCountY, groupCountZ);
+    recordTo(commandBuffer, groupCountX, groupCountY, groupCountZ);
 
-    vkEndCommandBuffer(cmdBuf);
+    vkEndCommandBuffer(commandBuffer);
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmdBuf;
+    submitInfo.pCommandBuffers = &commandBuffer;
 
     VkFence fence;
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -318,7 +391,65 @@ void ComputePipeline::dispatch(uint32_t groupCountX, uint32_t groupCountY, uint3
     vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX);
 
     vkDestroyFence(ctx->device, fence, nullptr);
-    vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmdBuf);
+}
+
+Sequence::Sequence(Context& context) : ctx(&context) {
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = ctx->cmdPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmd), "Failed to allocate cmd buffer");
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    check(vkCreateFence(ctx->device, &fenceInfo, nullptr, &fence), "Failed to create fence");
+}
+
+Sequence::~Sequence() {
+    if (ctx && ctx->device) {
+        if (cmd) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmd);
+        if (fence) vkDestroyFence(ctx->device, fence, nullptr);
+    }
+}
+
+void Sequence::begin() {
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &beginInfo), "Failed to begin cmd buffer");
+}
+
+void Sequence::end() {
+    check(vkEndCommandBuffer(cmd), "Failed to end cmd buffer");
+}
+
+void Sequence::submit() {
+    submitAndWait();
+}
+
+double Sequence::submitAndWait() {
+    vkResetFences(ctx->device, 1, &fence);
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    check(vkQueueSubmit(ctx->queue, 1, &submitInfo, fence), "Failed to submit queue");
+    check(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void Sequence::record(ComputePipeline& pipeline, uint32_t x, uint32_t y, uint32_t z, bool autoBarrier) {
+    pipeline.recordTo(cmd, x, y, z);
+    if (autoBarrier) {
+        ComputePipeline::barrier(cmd);
+    }
+}
+
+void Sequence::barrier() {
+    ComputePipeline::barrier(cmd);
 }
 
 } // namespace vkcompute

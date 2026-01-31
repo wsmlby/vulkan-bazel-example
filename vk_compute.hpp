@@ -31,6 +31,8 @@ public:
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkMemoryPropertyFlags propertyFlags = 0;
+    void* mapped = nullptr;
     Context* ctx = nullptr;
 
     Buffer() = default;
@@ -43,9 +45,13 @@ public:
 
     void upload(const void* data, VkDeviceSize dataSize);
     void download(void* data, VkDeviceSize dataSize);
+    
+    // Copy from another buffer (e.g., pinned memory)
+    void copyFrom(const Buffer& src, VkDeviceSize srcOffset = 0, VkDeviceSize dstOffset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
 };
 
 Buffer createDeviceBuffer(Context& ctx, VkDeviceSize size);
+Buffer createPinnedBuffer(Context& ctx, VkDeviceSize size);
 
 class ComputePipeline {
 public:
@@ -56,6 +62,7 @@ public:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
     ComputePipeline() = default;
     ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount);
@@ -64,7 +71,32 @@ public:
     ComputePipeline(ComputePipeline&& o) noexcept;
 
     void bindBuffers(const std::vector<Buffer*>& buffers);
+    
+    // Record commands to an external command buffer
+    void recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+    
+    static void barrier(VkCommandBuffer cmd);
+
+    // Helper for single-shot dispatch (internally manages a command buffer)
     void dispatch(uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+};
+
+class Sequence {
+public:
+    Context* ctx = nullptr;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+
+    Sequence(Context& ctx);
+    ~Sequence();
+
+    void begin();
+    void end();
+    void submit(); // Submit and wait
+    double submitAndWait(); // Returns execution time in ms
+
+    void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1, bool autoBarrier = true);
+    void barrier();
 };
 
 } // namespace vkcompute
