@@ -5,13 +5,18 @@ load("//:tools/shader.bzl", "glsl_shader")
 # Compile GLSL compute shader to SPIR-V
 glsl_shader(
     name = "vector_add_shader",
-    src = "shaders/vector_add.comp",
+    src = "shaders/vec_add.comp",
+)
+
+glsl_shader(
+    name = "vector_sub_shader",
+    src = "shaders/vec_sub.comp",
 )
 
 # Filegroup to ensure shader is included in runfiles
 filegroup(
     name = "shaders",
-    srcs = [":vector_add_shader"],
+    srcs = [":vector_add_shader", ":vector_sub_shader"],
 )
 
 

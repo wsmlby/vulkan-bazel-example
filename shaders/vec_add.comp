@@ -1,0 +1,13 @@
+#version 450
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+layout(binding = 0) readonly buffer InputA { float a[]; };
+layout(binding = 1) readonly buffer InputB { float b[]; };
+layout(binding = 2) writeonly buffer Output { float c[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    c[idx] = a[idx] + b[idx];
+}

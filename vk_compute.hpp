@@ -1,5 +1,6 @@
 #pragma once
-// Minimal Vulkan Compute - header only declarations
+// Minimal Vulkan Compute API - Simple abstraction for GPU compute operations
+// Provides easy-to-use wrappers for Vulkan compute shaders without graphics complexity
 
 #include <vulkan/vulkan.h>
 #include <vector>
@@ -7,8 +8,19 @@
 
 namespace vkcompute {
 
+// Utility function to check Vulkan result codes and throw on error
 void check(VkResult result, const char* msg);
 
+/**
+ * Context - Manages Vulkan instance, device, and command resources
+ * 
+ * This is the main entry point for the API. Create one Context per application.
+ * The Context automatically selects a compute-capable GPU and sets up command pools.
+ * 
+ * Example:
+ *   Context ctx("NVIDIA");  // Prefer NVIDIA GPU
+ *   std::cout << ctx.deviceName() << std::endl;
+ */
 class Context {
 public:
     VkInstance instance = VK_NULL_HANDLE;
@@ -23,14 +35,29 @@ public:
     VkCommandBuffer transferCmd = VK_NULL_HANDLE;
     VkFence transferFence = VK_NULL_HANDLE;
 
+    // Create a Vulkan context, optionally filtering devices by name (e.g., "NVIDIA", "AMD", "Intel")
     Context(const std::string& preferredDevice = "");
     ~Context();
 
+    // Get the name of the selected GPU device
     std::string deviceName() const;
-    void printLimits() const;  // Print device limits including allocation count
+    
+    // Print GPU capabilities including memory limits and max allocations
+    void printLimits() const;
+    
+    // Find a suitable memory type index for the given requirements
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 };
 
+/**
+ * Buffer - GPU memory allocation with optional CPU mapping
+ * 
+ * Represents a Vulkan buffer with associated device memory.
+ * Use createDeviceBuffer() for fast GPU-only memory.
+ * Use createPinnedBuffer() for CPU-accessible memory (mapped pointer available).
+ * 
+ * Buffers are move-only to prevent accidental copying of GPU resources.
+ */
 class Buffer {
 public:
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -45,21 +72,56 @@ public:
            VkMemoryPropertyFlags memProps);
     ~Buffer();
 
+    // Move semantics (buffers are not copyable)
     Buffer(Buffer&& o) noexcept;
     Buffer& operator=(Buffer&& o) noexcept;
-
-    void upload(const void* data, VkDeviceSize dataSize);
-    void download(void* data, VkDeviceSize dataSize);
     
-    // Copy from another buffer (e.g., pinned memory)
+    // GPU-to-GPU copy from another buffer (efficient, no CPU involvement)
+    // Use VK_WHOLE_SIZE for size parameter to copy entire buffer
     void copyFrom(const Buffer& src, VkDeviceSize srcOffset = 0, VkDeviceSize dstOffset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
 };
 
+// Create a device-local buffer (fast GPU memory, not CPU-accessible)
+// Best for intermediate results and main compute working memory
 Buffer createDeviceBuffer(Context& ctx, VkDeviceSize size);
+
+// Create a pinned (host-visible) buffer (CPU-accessible via .mapped pointer)
+// Best for CPU-GPU data transfer; slower for GPU computation
 Buffer createPinnedBuffer(Context& ctx, VkDeviceSize size);
 
+/**
+ * ComputePipeline - Compiled compute shader with buffer bindings
+ * 
+ * Loads a SPIR-V shader and creates a Vulkan pipeline for execution.
+ * Buffers are bound in the order they appear in the shader (layout binding 0, 1, 2, ...).
+ * 
+ * Example:
+ *   ComputePipeline pipeline(ctx, "shader.spv", 3, 256);  // 3 buffers, 256 threads per workgroup
+ *   pipeline.bindBuffers({&bufA, &bufB, &bufC});
+ */
 class ComputePipeline {
 public:
+    ComputePipeline() = default;
+    
+    // Create a compute pipeline from a SPIR-V shader file
+    // bufferCount: number of buffers the shader uses
+    // workgroupSize: local workgroup size (should match shader's local_size_x)
+    ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount, uint32_t workgroupSize = 256);
+    ~ComputePipeline();
+
+    ComputePipeline(ComputePipeline&& o) noexcept;
+
+    // Bind buffers to descriptor set (order must match shader layout bindings)
+    void bindBuffers(const std::vector<Buffer*>& buffers);
+    
+    // Record dispatch commands to an external command buffer
+    // groupCount parameters specify the number of workgroups in each dimension
+    void recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+    
+    // Insert a pipeline barrier for memory synchronization
+    static void barrier(VkCommandBuffer cmd);
+
+private:
     Context* ctx = nullptr;
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     VkDescriptorSetLayout descLayout = VK_NULL_HANDLE;
@@ -67,37 +129,50 @@ public:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
-
-    ComputePipeline() = default;
-    ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount);
-    ~ComputePipeline();
-
-    ComputePipeline(ComputePipeline&& o) noexcept;
-
-    void bindBuffers(const std::vector<Buffer*>& buffers);
-    
-    // Record commands to an external command buffer
-    void recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
-    
-    static void barrier(VkCommandBuffer cmd);
 };
 
+/**
+ * Sequence - Command buffer for batching GPU operations
+ * 
+ * Records multiple compute dispatches and barriers into a single submission.
+ * Allows efficient batching of operations and provides timing information.
+ * 
+ * Example:
+ *   Sequence seq(ctx);
+ *   seq.begin();
+ *   seq.record(pipeline, numGroups);
+ *   seq.barrier();
+ *   seq.end();
+ *   double timeMs = seq.submitAndWait();  // Execute and measure time
+ */
 class Sequence {
 public:
-    Context* ctx = nullptr;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-
     Sequence(Context& ctx);
     ~Sequence();
 
+    // Start recording commands
     void begin();
+    
+    // Finish recording commands (must be called before submit)
     void end();
-    void submit(); // Submit and wait
-    double submitAndWait(); // Returns execution time in ms
+    
+    // Submit commands and wait for completion
+    void submit();
+    
+    // Submit commands, wait for completion, and return execution time in milliseconds
+    double submitAndWait();
 
+    // Record a compute shader dispatch
+    // groupCount parameters specify the number of workgroups in each dimension
     void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
+    
+    // Insert a memory barrier to ensure previous operations complete before continuing
     void barrier();
+
+private:
+    Context* ctx = nullptr;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
 };
 
 } // namespace vkcompute
