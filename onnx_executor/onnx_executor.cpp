@@ -339,15 +339,68 @@ void Executor::prepare() {
     // Create transfer sequence for input copies
     transferSequence_ = std::make_unique<vkcompute::Sequence>(*ctx_);
 
+    // Dependency analysis: determine which operations need barriers before them
+    // A barrier is needed when an op reads a tensor that was written by a previous op
+    // without any barrier in between.
+    
+    // Track tensors that have been written since the last barrier
+    std::set<std::string> dirtyTensors;
+    
+    // Also track which tensors are written by compute (vs initializers/inputs which don't need barriers)
+    std::set<std::string> computeWrittenTensors;
+    
+    // Analyze dependencies and mark which ops need a barrier before them
+    std::vector<bool> needsBarrierBefore(preparedOps_.size(), false);
+    
+    for (size_t i = 0; i < preparedOps_.size(); i++) {
+        auto& prepared = preparedOps_[i];
+        
+        // Check if any input is in the dirty set (written since last barrier)
+        bool needsBarrier = false;
+        for (const auto& inputName : prepared.node->inputs) {
+            if (inputName.empty()) continue;
+            if (dirtyTensors.count(inputName) > 0) {
+                needsBarrier = true;
+                break;
+            }
+        }
+        
+        if (needsBarrier) {
+            needsBarrierBefore[i] = true;
+            dirtyTensors.clear();  // Barrier will flush all dirty tensors
+        }
+        
+        // Mark outputs as dirty and compute-written
+        for (const auto& outputName : prepared.node->outputs) {
+            if (!outputName.empty()) {
+                dirtyTensors.insert(outputName);
+                computeWrittenTensors.insert(outputName);
+            }
+        }
+    }
+    
+    // Count barriers for logging
+    int barrierCount = 0;
+    for (bool b : needsBarrierBefore) if (b) barrierCount++;
+    
     // Pre-record all operations (reusable command buffer)
     sequence_->begin(true);  // reusable = true
-    for (auto& prepared : preparedOps_) {
+    for (size_t i = 0; i < preparedOps_.size(); i++) {
+        auto& prepared = preparedOps_[i];
+        
+        // Insert barrier if needed
+        if (needsBarrierBefore[i]) {
+            sequence_->barrier();
+        }
+        
         prepared.op->record(*sequence_, prepared.inputs, prepared.outputs, *prepared.node);
-        sequence_->barrier();
     }
+    // Final barrier before end (needed for output reads)
+    sequence_->barrier();
     sequence_->end();
 
-    std::cout << "Prepared " << preparedOps_.size() << " operators" << std::endl;
+    std::cout << "Prepared " << preparedOps_.size() << " operators with " 
+              << barrierCount << " barriers (was " << preparedOps_.size() << ")" << std::endl;
 }
 
 std::map<std::string, Tensor*> Executor::run(std::map<std::string, Tensor>& inputs) {

@@ -284,9 +284,9 @@ int main(int argc, char** argv) {
     try {
         std::string modelPath = "model.onnx";
         std::string deviceFilter = "";
-        std::string inputPath = "";
-        int inputWidth = 0;
-        int inputHeight = 0;
+        std::string inputPath = "frame.raw";
+        int inputWidth = 800;
+        int inputHeight = 1280;
         float confThreshold = 0.25f;
         float iouThreshold = 0.45f;
 

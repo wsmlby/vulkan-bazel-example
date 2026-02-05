@@ -515,9 +515,48 @@ void Sequence::record(ComputePipeline& pipeline, uint32_t x, uint32_t y, uint32_
     pipeline.recordTo(cmd_, x, y, z);
 }
 
+// Record a buffer copy operation
+void Sequence::recordCopy(const Buffer& src, Buffer& dst, VkDeviceSize size) {
+    if (size == VK_WHOLE_SIZE) size = src.size;
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = size;
+    vkCmdCopyBuffer(cmd_, src.buffer, dst.buffer, 1, &copyRegion);
+}
+
 // Record a memory barrier (delegates to pipeline's static barrier method)
 void Sequence::barrier() {
     ComputePipeline::barrier(cmd_);
+}
+
+// Insert a transfer-to-compute barrier
+void Sequence::transferBarrier() {
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd_,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+// Submit with a prefix command buffer (e.g., transfers before pre-recorded compute)
+double Sequence::submitWithPrefixAndWait(VkCommandBuffer prefixCmd) {
+    vkResetFences(ctx->device, 1, &fence);
+
+    VkCommandBuffer cmdBuffers[2] = { prefixCmd, cmd_ };
+    
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 2;
+    submitInfo.pCommandBuffers = cmdBuffers;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    check(vkQueueSubmit(ctx->queue, 1, &submitInfo, fence), "Failed to submit queue");
+    check(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 } // namespace vkcompute

@@ -181,8 +181,18 @@ public:
     // groupCount parameters specify the number of workgroups in each dimension
     void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
     
+    // Record a buffer copy operation
+    void recordCopy(const Buffer& src, Buffer& dst, VkDeviceSize size = VK_WHOLE_SIZE);
+    
     // Insert a memory barrier to ensure previous operations complete before continuing
     void barrier();
+    
+    // Insert a transfer-to-compute barrier (for after buffer copies)
+    void transferBarrier();
+
+    // Submit this sequence with a prefix command buffer, wait for completion, return time in ms
+    // Useful for batching transfer commands with pre-recorded compute commands
+    double submitWithPrefixAndWait(VkCommandBuffer prefixCmd);
 
     // Get underlying command buffer (for advanced use)
     VkCommandBuffer cmdBuffer() const { return cmd_; }
