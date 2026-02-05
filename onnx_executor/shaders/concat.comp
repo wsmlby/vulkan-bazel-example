@@ -1,0 +1,18 @@
+#version 450
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+// Placeholder shader for concat - actual implementation depends on axis and inputs
+layout(push_constant) uniform PC {
+    uint totalElements;
+    uint offset;
+} p;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.totalElements) return;
+    output_data[p.offset + idx] = input_data[idx];
+}

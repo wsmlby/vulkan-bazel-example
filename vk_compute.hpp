@@ -91,33 +91,43 @@ Buffer createPinnedBuffer(Context& ctx, VkDeviceSize size);
 
 /**
  * ComputePipeline - Compiled compute shader with buffer bindings
- * 
+ *
  * Loads a SPIR-V shader and creates a Vulkan pipeline for execution.
  * Buffers are bound in the order they appear in the shader (layout binding 0, 1, 2, ...).
- * 
+ *
  * Example:
  *   ComputePipeline pipeline(ctx, "shader.spv", 3, 256);  // 3 buffers, 256 threads per workgroup
  *   pipeline.bindBuffers({&bufA, &bufB, &bufC});
+ *
+ * With push constants:
+ *   ComputePipeline pipeline(ctx, "shader.spv", 3, 256, sizeof(MyParams));
+ *   pipeline.bindBuffers({&bufA, &bufB, &bufC});
+ *   pipeline.setPushConstants(&params, sizeof(params));
  */
 class ComputePipeline {
 public:
     ComputePipeline() = default;
-    
+
     // Create a compute pipeline from a SPIR-V shader file
     // bufferCount: number of buffers the shader uses
     // workgroupSize: local workgroup size (should match shader's local_size_x)
-    ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount, uint32_t workgroupSize = 256);
+    // pushConstantSize: size of push constants in bytes (0 to disable)
+    ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount,
+                    uint32_t workgroupSize = 256, uint32_t pushConstantSize = 0);
     ~ComputePipeline();
 
     ComputePipeline(ComputePipeline&& o) noexcept;
 
     // Bind buffers to descriptor set (order must match shader layout bindings)
     void bindBuffers(const std::vector<Buffer*>& buffers);
-    
+
+    // Set push constant data (must be called before recordTo if using push constants)
+    void setPushConstants(const void* data, uint32_t size);
+
     // Record dispatch commands to an external command buffer
     // groupCount parameters specify the number of workgroups in each dimension
     void recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
-    
+
     // Insert a pipeline barrier for memory synchronization
     static void barrier(VkCommandBuffer cmd);
 
@@ -129,6 +139,10 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
+
+    // Push constants support
+    uint32_t pushConstantSize_ = 0;
+    std::vector<uint8_t> pushConstantData_;
 };
 
 /**
@@ -169,9 +183,12 @@ public:
     // Insert a memory barrier to ensure previous operations complete before continuing
     void barrier();
 
+    // Get underlying command buffer (for advanced use)
+    VkCommandBuffer cmdBuffer() const { return cmd_; }
+
 private:
     Context* ctx = nullptr;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
 };
 

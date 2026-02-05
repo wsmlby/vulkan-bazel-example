@@ -26,6 +26,8 @@ cc_library(
         "vk_compute.cpp",
         "vk_compute.hpp",
     ],
+    hdrs = ["vk_compute.hpp"],
+    visibility = ["//visibility:public"],
     deps = ["@vulkan_headers//:vulkan_headers"],
     linkopts = [
         "-l:libvulkan.so.1",

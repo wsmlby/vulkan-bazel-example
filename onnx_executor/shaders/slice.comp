@@ -1,0 +1,40 @@
+#version 450
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+// Push constants for 4D slice operation
+layout(push_constant) uniform PC {
+    uint outN, outC, outH, outW;      // Output dimensions
+    uint inN, inC, inH, inW;          // Input dimensions  
+    int startN, startC, startH, startW;  // Start indices
+    int stepN, stepC, stepH, stepW;      // Step sizes
+} p;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.outN * p.outC * p.outH * p.outW;
+    if (idx >= total) return;
+    
+    // Convert flat index to 4D output coordinates
+    uint w = idx % p.outW;
+    uint h = (idx / p.outW) % p.outH;
+    uint c = (idx / (p.outW * p.outH)) % p.outC;
+    uint n = idx / (p.outW * p.outH * p.outC);
+    
+    // Map to input coordinates
+    int in_n = p.startN + int(n) * p.stepN;
+    int in_c = p.startC + int(c) * p.stepC;
+    int in_h = p.startH + int(h) * p.stepH;
+    int in_w = p.startW + int(w) * p.stepW;
+    
+    // Compute input index
+    uint inIdx = uint(in_n) * p.inC * p.inH * p.inW +
+                 uint(in_c) * p.inH * p.inW +
+                 uint(in_h) * p.inW +
+                 uint(in_w);
+    
+    output_data[idx] = input_data[inIdx];
+}

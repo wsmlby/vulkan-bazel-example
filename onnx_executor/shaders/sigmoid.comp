@@ -1,0 +1,20 @@
+#version 450
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint totalElements;
+    float param;  // unused for sigmoid
+    uint pad0;
+    uint pad1;
+} params;
+
+layout(binding = 0) readonly buffer Input { float a[]; };
+layout(binding = 1) writeonly buffer Output { float c[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.totalElements) return;
+    c[idx] = 1.0 / (1.0 + exp(-a[idx]));
+}

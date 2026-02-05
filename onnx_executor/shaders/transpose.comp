@@ -1,0 +1,35 @@
+#version 450
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PC {
+    uint totalElements;
+    uint ndims;
+    uint inputStrides[8];
+    uint outputStrides[8];
+    uint perm[8];
+} p;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.totalElements) return;
+
+    // Convert output linear index to output coordinates
+    uint outCoords[8];
+    uint remaining = idx;
+    for (uint i = 0; i < p.ndims; i++) {
+        outCoords[i] = remaining / p.outputStrides[i];
+        remaining = remaining % p.outputStrides[i];
+    }
+
+    // Map to input coordinates via permutation
+    uint inputIdx = 0;
+    for (uint i = 0; i < p.ndims; i++) {
+        inputIdx += outCoords[i] * p.inputStrides[p.perm[i]];
+    }
+
+    output_data[idx] = input_data[inputIdx];
+}

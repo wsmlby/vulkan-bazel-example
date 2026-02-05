@@ -267,8 +267,9 @@ Buffer createPinnedBuffer(Context& ctx, VkDeviceSize size) {
 // ComputePipeline: Shader loading and pipeline creation
 // ============================================================================
 
-ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount, uint32_t workgroupSize)
-    : ctx(&context) {
+ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount,
+                                 uint32_t workgroupSize, uint32_t pushConstantSize)
+    : ctx(&context), pushConstantSize_(pushConstantSize) {
 
     // Load compiled SPIR-V shader from file
     std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
@@ -304,10 +305,20 @@ ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, u
     check(vkCreateDescriptorSetLayout(ctx->device, &layoutInfo, nullptr, &descLayout),
           "Failed to create descriptor layout");
 
-    // Create pipeline layout (defines resource bindings for the pipeline)
+    // Create pipeline layout with optional push constants
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = pushConstantSize_;
+
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pipelineLayoutInfo.setLayoutCount = 1;
     pipelineLayoutInfo.pSetLayouts = &descLayout;
+    if (pushConstantSize_ > 0) {
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+        pushConstantData_.resize(pushConstantSize_);
+    }
     check(vkCreatePipelineLayout(ctx->device, &pipelineLayoutInfo, nullptr, &pipelineLayout),
           "Failed to create pipeline layout");
 
@@ -370,7 +381,8 @@ ComputePipeline::~ComputePipeline() {
 ComputePipeline::ComputePipeline(ComputePipeline&& o) noexcept
     : ctx(o.ctx), shaderModule(o.shaderModule), descLayout(o.descLayout),
       pipelineLayout(o.pipelineLayout), pipeline(o.pipeline),
-      descPool(o.descPool), descSet(o.descSet) {
+      descPool(o.descPool), descSet(o.descSet),
+      pushConstantSize_(o.pushConstantSize_), pushConstantData_(std::move(o.pushConstantData_)) {
     o.ctx = nullptr;
     o.shaderModule = VK_NULL_HANDLE;
     o.descLayout = VK_NULL_HANDLE;
@@ -378,6 +390,7 @@ ComputePipeline::ComputePipeline(ComputePipeline&& o) noexcept
     o.pipeline = VK_NULL_HANDLE;
     o.descPool = VK_NULL_HANDLE;
     o.descSet = VK_NULL_HANDLE;
+    o.pushConstantSize_ = 0;
 }
 
 // Bind buffers to the descriptor set
@@ -402,11 +415,24 @@ void ComputePipeline::bindBuffers(const std::vector<Buffer*>& buffers) {
                            writes.data(), 0, nullptr);
 }
 
+// Set push constant data (stored internally, will be pushed during recordTo)
+void ComputePipeline::setPushConstants(const void* data, uint32_t size) {
+    if (size > pushConstantSize_) {
+        throw std::runtime_error("Push constant data exceeds allocated size");
+    }
+    std::memcpy(pushConstantData_.data(), data, size);
+}
+
 // Record pipeline bind and dispatch commands to a command buffer
 void ComputePipeline::recordTo(VkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout,
                             0, 1, &descSet, 0, nullptr);
+    // Push constants if configured
+    if (pushConstantSize_ > 0) {
+        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, pushConstantSize_, pushConstantData_.data());
+    }
     vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
 }
 
@@ -431,7 +457,7 @@ Sequence::Sequence(Context& context) : ctx(&context) {
     allocInfo.commandPool = ctx->cmdPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
-    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmd), "Failed to allocate cmd buffer");
+    check(vkAllocateCommandBuffers(ctx->device, &allocInfo, &cmd_), "Failed to allocate cmd buffer");
 
     // Create fence for CPU-GPU synchronization
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -440,22 +466,22 @@ Sequence::Sequence(Context& context) : ctx(&context) {
 
 Sequence::~Sequence() {
     if (ctx && ctx->device) {
-        if (cmd) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmd);
+        if (cmd_) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmd_);
         if (fence) vkDestroyFence(ctx->device, fence, nullptr);
     }
 }
 
 // Begin recording commands into the command buffer
 void Sequence::begin() {
-    vkResetCommandBuffer(cmd, 0);
+    vkResetCommandBuffer(cmd_, 0);
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(cmd, &beginInfo), "Failed to begin cmd buffer");
+    check(vkBeginCommandBuffer(cmd_, &beginInfo), "Failed to begin cmd buffer");
 }
 
 // Finish recording commands
 void Sequence::end() {
-    check(vkEndCommandBuffer(cmd), "Failed to end cmd buffer");
+    check(vkEndCommandBuffer(cmd_), "Failed to end cmd buffer");
 }
 
 // Submit commands and wait for completion (no timing)
@@ -469,7 +495,7 @@ double Sequence::submitAndWait() {
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.pCommandBuffers = &cmd_;
 
     // Measure GPU execution time using CPU timestamps (includes queue latency)
     auto start = std::chrono::high_resolution_clock::now();
@@ -482,12 +508,12 @@ double Sequence::submitAndWait() {
 
 // Record a compute dispatch (delegates to pipeline's recordTo method)
 void Sequence::record(ComputePipeline& pipeline, uint32_t x, uint32_t y, uint32_t z) {
-    pipeline.recordTo(cmd, x, y, z);
+    pipeline.recordTo(cmd_, x, y, z);
 }
 
 // Record a memory barrier (delegates to pipeline's static barrier method)
 void Sequence::barrier() {
-    ComputePipeline::barrier(cmd);
+    ComputePipeline::barrier(cmd_);
 }
 
 } // namespace vkcompute

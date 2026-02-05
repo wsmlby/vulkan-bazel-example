@@ -1,0 +1,31 @@
+#version 450
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PC {
+    uint N, C, inH, inW, outH, outW;
+    float scaleH, scaleW;
+} p;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.N * p.C * p.outH * p.outW;
+    if (idx >= total) return;
+
+    uint ow = idx % p.outW;
+    uint oh = (idx / p.outW) % p.outH;
+    uint c = (idx / (p.outW * p.outH)) % p.C;
+    uint n = idx / (p.outW * p.outH * p.C);
+
+    // Nearest neighbor resize
+    float srcH = float(oh) * p.scaleH;
+    float srcW = float(ow) * p.scaleW;
+    uint ih = min(uint(srcH), p.inH - 1);
+    uint iw = min(uint(srcW), p.inW - 1);
+
+    uint inputIdx = n * p.C * p.inH * p.inW + c * p.inH * p.inW + ih * p.inW + iw;
+    output_data[idx] = input_data[inputIdx];
+}

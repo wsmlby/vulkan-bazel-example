@@ -59,3 +59,12 @@ http_archive(
     urls = ["https://github.com/google/shaderc/archive/refs/tags/v2025.4.tar.gz"],
     build_file = "@//:third_party/shaderc.BUILD",
 )
+
+# ONNX v1.17.0
+http_archive(
+    name = "onnx",
+    sha256 = "8d5e983c36037003615e5a02d36b18fc286541bf52de1a78f6cf9f32005a820e",
+    strip_prefix = "onnx-1.17.0",
+    urls = ["https://github.com/onnx/onnx/archive/refs/tags/v1.17.0.tar.gz"],
+    build_file = "@//:third_party/onnx.BUILD",
+)

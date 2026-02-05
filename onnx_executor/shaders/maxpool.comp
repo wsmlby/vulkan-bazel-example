@@ -1,0 +1,38 @@
+#version 450
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PC {
+    uint N, C, H, W;
+    uint outH, outW;
+    uint kH, kW;
+    uint strideH, strideW;
+    uint padH, padW;
+} p;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.N * p.C * p.outH * p.outW;
+    if (idx >= total) return;
+
+    uint ow = idx % p.outW;
+    uint oh = (idx / p.outW) % p.outH;
+    uint c = (idx / (p.outW * p.outH)) % p.C;
+    uint n = idx / (p.outW * p.outH * p.C);
+
+    float maxVal = -1e38;
+    for (uint kh = 0; kh < p.kH; kh++) {
+        for (uint kw = 0; kw < p.kW; kw++) {
+            int ih = int(oh * p.strideH) - int(p.padH) + int(kh);
+            int iw = int(ow * p.strideW) - int(p.padW) + int(kw);
+            if (ih >= 0 && ih < int(p.H) && iw >= 0 && iw < int(p.W)) {
+                uint inputIdx = n * p.C * p.H * p.W + c * p.H * p.W + uint(ih) * p.W + uint(iw);
+                maxVal = max(maxVal, input_data[inputIdx]);
+            }
+        }
+    }
+    output_data[idx] = maxVal;
+}
