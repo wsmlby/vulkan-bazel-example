@@ -335,6 +335,9 @@ void Executor::prepare() {
 
     // Create sequence for recording
     sequence_ = std::make_unique<vkcompute::Sequence>(*ctx_);
+    
+    // Create transfer sequence for input copies
+    transferSequence_ = std::make_unique<vkcompute::Sequence>(*ctx_);
 
     // Pre-record all operations (reusable command buffer)
     sequence_->begin(true);  // reusable = true
@@ -355,17 +358,21 @@ std::map<std::string, Tensor*> Executor::run(std::map<std::string, Tensor>& inpu
 
 double Executor::runTimed(std::map<std::string, Tensor>& inputs,
                           std::map<std::string, Tensor*>& outputs) {
-    // Copy user-provided inputs to device-local tensors
+    // Record input copies into transfer sequence
+    transferSequence_->begin();
     for (auto& [name, userTensor] : inputs) {
         auto it = inputTensors_.find(name);
         if (it != inputTensors_.end()) {
-            // Copy from pinned (user) tensor to device-local tensor
-            it->second->buffer().copyFrom(userTensor.buffer());
+            // Record copy from pinned (user) tensor to device-local tensor
+            transferSequence_->recordCopy(userTensor.buffer(), it->second->buffer());
         }
     }
+    // Barrier to ensure transfers complete before compute reads
+    transferSequence_->transferBarrier();
+    transferSequence_->end();
 
-    // Commands are pre-recorded in prepare(), just submit
-    double timeMs = sequence_->submitAndWait();
+    // Submit both transfer and compute commands in one batch
+    double timeMs = sequence_->submitWithPrefixAndWait(transferSequence_->cmdBuffer());
 
     // Return output pointers
     for (auto& [name, tensor] : outputs_) {

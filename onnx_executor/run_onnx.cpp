@@ -432,6 +432,73 @@ int main(int argc, char** argv) {
                               << " size=" << (int)(d.x2-d.x1) << "x" << (int)(d.y2-d.y1)
                               << std::endl;
                 }
+                // Validation against expected results
+                {
+                    bool valid = true;
+                    std::string errorMsg;
+                    
+                    // Expected detections
+                    struct Expected {
+                        int classId;
+                        float conf;
+                        int x1, y1, x2, y2;
+                    };
+                    std::vector<Expected> expected = {
+                        {3, 0.967f, 410, 515, 775, 831},  // class3
+                        {0, 0.904f, 0, 312, 422, 866},   // class0
+                        {2, 0.864f, 26, 436, 287, 715},  // class2
+                    };
+                    
+                    const int boxTolerance = 10;  // pixels
+                    const float confTolerance = 0.05f;
+                    
+                    if (detections.size() != expected.size()) {
+                        valid = false;
+                        errorMsg = "Expected " + std::to_string(expected.size()) + 
+                                   " detections, got " + std::to_string(detections.size());
+                    } else {
+                        for (size_t i = 0; i < expected.size(); i++) {
+                            const auto& d = detections[i];
+                            const auto& e = expected[i];
+                            
+                            if (d.classId != e.classId) {
+                                valid = false;
+                                errorMsg = "Detection[" + std::to_string(i) + "] class mismatch: expected " + 
+                                           std::to_string(e.classId) + ", got " + std::to_string(d.classId);
+                                break;
+                            }
+                            if (std::abs(d.confidence - e.conf) > confTolerance) {
+                                valid = false;
+                                errorMsg = "Detection[" + std::to_string(i) + "] confidence mismatch: expected " + 
+                                           std::to_string(e.conf) + ", got " + std::to_string(d.confidence);
+                                break;
+                            }
+                            if (std::abs((int)d.x1 - e.x1) > boxTolerance ||
+                                std::abs((int)d.y1 - e.y1) > boxTolerance ||
+                                std::abs((int)d.x2 - e.x2) > boxTolerance ||
+                                std::abs((int)d.y2 - e.y2) > boxTolerance) {
+                                valid = false;
+                                errorMsg = "Detection[" + std::to_string(i) + "] box mismatch: expected (" + 
+                                           std::to_string(e.x1) + "," + std::to_string(e.y1) + "," +
+                                           std::to_string(e.x2) + "," + std::to_string(e.y2) + "), got (" +
+                                           std::to_string((int)d.x1) + "," + std::to_string((int)d.y1) + "," +
+                                           std::to_string((int)d.x2) + "," + std::to_string((int)d.y2) + ")";
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (!valid) {
+                        std::cerr << "\n*** VALIDATION FAILED ***" << std::endl;
+                        std::cerr << errorMsg << std::endl;
+                        std::cerr << "Expected:" << std::endl;
+                        std::cerr << "  [0] class3 conf=0.967 box=(410, 515, 775, 831)" << std::endl;
+                        std::cerr << "  [1] class0 conf=0.904 box=(0, 312, 422, 866)" << std::endl;
+                        std::cerr << "  [2] class2 conf=0.864 box=(26, 436, 287, 715)" << std::endl;
+                        return -1;
+                    }
+                    std::cout << "\n*** VALIDATION PASSED ***" << std::endl;
+                }
             }
         }
 

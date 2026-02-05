@@ -82,6 +82,9 @@ private:
 
     // Sequence for recording commands
     std::unique_ptr<vkcompute::Sequence> sequence_;
+    
+    // Transfer sequence for input copies (recorded fresh each frame)
+    std::unique_ptr<vkcompute::Sequence> transferSequence_;
 
     // Prepare the graph (allocate intermediates, create pipelines)
     void prepare();

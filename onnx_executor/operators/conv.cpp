@@ -94,9 +94,11 @@ void ConvOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs
                     const std::vector<Tensor*>& outputs, const Node& node) {
     pipeline_->setPushConstants(&params_, sizeof(params_));
 
-    // Dispatch one thread per output element
-    uint32_t totalOutputs = params_.N * params_.K * params_.outH * params_.outW;
-    uint32_t numGroups = (totalOutputs + 255) / 256;
+    // Dispatch with tiling: each thread handles TILE_OW=4 consecutive output pixels
+    const uint32_t TILE_OW = 4;
+    uint32_t tiledOutW = (params_.outW + TILE_OW - 1) / TILE_OW;
+    uint32_t totalTiles = params_.N * params_.K * params_.outH * tiledOutW;
+    uint32_t numGroups = (totalTiles + 255) / 256;
     pipeline_->recordTo(seq.cmdBuffer(), numGroups);
 }
 

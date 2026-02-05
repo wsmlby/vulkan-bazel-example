@@ -1,7 +1,12 @@
 #version 450
 
+// Optimized convolution shader with output tiling and manual loop unrolling
+// Each thread computes TILE_OW consecutive outputs for weight reuse
+
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
-layout(local_size_x_id = 0) in;
+layout(local_size_x = 256) in;
+
+const uint TILE_OW = 4;  // Process 4 output pixels per thread
 
 layout(push_constant) uniform PushConstants {
     uint N;         // Batch size
@@ -25,59 +30,93 @@ layout(push_constant) uniform PushConstants {
 
 layout(binding = 0) readonly buffer Input { float input_data[]; };
 layout(binding = 1) readonly buffer Weight { float weight_data[]; };
-layout(binding = 2) writeonly buffer Output { float output_data[]; };
+layout(binding = 2) buffer Output { float output_data[]; };
 layout(binding = 3) readonly buffer Bias { float bias_data[]; };
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint totalOutputs = params.N * params.K * params.outH * params.outW;
-    if (idx >= totalOutputs) return;
+    
+    // Each thread handles TILE_OW consecutive output pixels along width
+    uint tiledOutW = (params.outW + TILE_OW - 1) / TILE_OW;
+    uint totalTiles = params.N * params.K * params.outH * tiledOutW;
+    if (idx >= totalTiles) return;
 
-    // Decode output index: [n, k, oh, ow]
-    uint ow = idx % params.outW;
-    uint temp = idx / params.outW;
+    // Decode tile index: [n, k, oh, tileOw]
+    uint tileOw = idx % tiledOutW;
+    uint temp = idx / tiledOutW;
     uint oh = temp % params.outH;
     temp = temp / params.outH;
     uint k = temp % params.K;
     uint n = temp / params.K;
+    
+    uint owBase = tileOw * TILE_OW;
 
-    // Compute convolution
-    float sum = 0.0;
+    // Accumulate - fully unrolled for TILE_OW=4
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
 
     uint channelsPerGroup = params.C / params.groups;
     uint filtersPerGroup = params.K / params.groups;
     uint group = k / filtersPerGroup;
-    uint kInGroup = k % filtersPerGroup;
+
+    // Pre-compute base indices
+    uint inputBaseN = n * params.C * params.H * params.W;
+    uint weightBaseK = k * channelsPerGroup * params.R * params.S;
+    
+    int ihBase = int(oh * params.strideH) - int(params.padH);
+    int iwBase0 = int(owBase * params.strideW) - int(params.padW);
+    int iwBase1 = iwBase0 + int(params.strideW);
+    int iwBase2 = iwBase1 + int(params.strideW);
+    int iwBase3 = iwBase2 + int(params.strideW);
+    
+    // Bounds check for outputs
+    bool valid0 = (owBase + 0) < params.outW;
+    bool valid1 = (owBase + 1) < params.outW;
+    bool valid2 = (owBase + 2) < params.outW;
+    bool valid3 = (owBase + 3) < params.outW;
 
     for (uint c = 0; c < channelsPerGroup; c++) {
         uint actualC = group * channelsPerGroup + c;
+        uint inputBaseC = inputBaseN + actualC * params.H * params.W;
+        uint weightBaseC = weightBaseK + c * params.R * params.S;
+
         for (uint r = 0; r < params.R; r++) {
-            for (uint s = 0; s < params.S; s++) {
-                int ih = int(oh * params.strideH) - int(params.padH) + int(r * params.dilationH);
-                int iw = int(ow * params.strideW) - int(params.padW) + int(s * params.dilationW);
+            int ih = ihBase + int(r * params.dilationH);
+            
+            if (ih >= 0 && ih < int(params.H)) {
+                uint inputBaseH = inputBaseC + uint(ih) * params.W;
+                uint weightBaseR = weightBaseC + r * params.S;
 
-                if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W)) {
-                    // Input index: [n, c, h, w] -> n*C*H*W + c*H*W + h*W + w
-                    uint inputIdx = n * params.C * params.H * params.W +
-                                    actualC * params.H * params.W +
-                                    uint(ih) * params.W + uint(iw);
-
-                    // Weight index: [k, c, r, s] -> k*Cin*R*S + c*R*S + r*S + s
-                    uint weightIdx = k * channelsPerGroup * params.R * params.S +
-                                     c * params.R * params.S +
-                                     r * params.S + s;
-
-                    sum += input_data[inputIdx] * weight_data[weightIdx];
+                for (uint s = 0; s < params.S; s++) {
+                    float w = weight_data[weightBaseR + s];
+                    int dw = int(s * params.dilationW);
+                    
+                    int iw0 = iwBase0 + dw;
+                    int iw1 = iwBase1 + dw;
+                    int iw2 = iwBase2 + dw;
+                    int iw3 = iwBase3 + dw;
+                    
+                    // Branchless-ish accumulation with bounds check
+                    if (valid0 && iw0 >= 0 && iw0 < int(params.W))
+                        sum0 += input_data[inputBaseH + uint(iw0)] * w;
+                    if (valid1 && iw1 >= 0 && iw1 < int(params.W))
+                        sum1 += input_data[inputBaseH + uint(iw1)] * w;
+                    if (valid2 && iw2 >= 0 && iw2 < int(params.W))
+                        sum2 += input_data[inputBaseH + uint(iw2)] * w;
+                    if (valid3 && iw3 >= 0 && iw3 < int(params.W))
+                        sum3 += input_data[inputBaseH + uint(iw3)] * w;
                 }
             }
         }
     }
 
-    // Add bias if present
-    if (params.hasBias != 0u) {
-        sum += bias_data[k];
-    }
-
-    // Output index: [n, k, oh, ow]
-    output_data[idx] = sum;
+    // Add bias and write outputs
+    float bias = (params.hasBias != 0u) ? bias_data[k] : 0.0;
+    uint outBaseIdx = n * params.K * params.outH * params.outW + 
+                      k * params.outH * params.outW + 
+                      oh * params.outW + owBase;
+    
+    if (valid0) output_data[outBaseIdx + 0] = sum0 + bias;
+    if (valid1) output_data[outBaseIdx + 1] = sum1 + bias;
+    if (valid2) output_data[outBaseIdx + 2] = sum2 + bias;
+    if (valid3) output_data[outBaseIdx + 3] = sum3 + bias;
 }
