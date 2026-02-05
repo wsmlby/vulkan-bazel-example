@@ -336,6 +336,14 @@ void Executor::prepare() {
     // Create sequence for recording
     sequence_ = std::make_unique<vkcompute::Sequence>(*ctx_);
 
+    // Pre-record all operations (reusable command buffer)
+    sequence_->begin(true);  // reusable = true
+    for (auto& prepared : preparedOps_) {
+        prepared.op->record(*sequence_, prepared.inputs, prepared.outputs, *prepared.node);
+        sequence_->barrier();
+    }
+    sequence_->end();
+
     std::cout << "Prepared " << preparedOps_.size() << " operators" << std::endl;
 }
 
@@ -356,18 +364,7 @@ double Executor::runTimed(std::map<std::string, Tensor>& inputs,
         }
     }
 
-    // Begin recording
-    sequence_->begin();
-
-    // Record all operations
-    for (auto& prepared : preparedOps_) {
-        prepared.op->record(*sequence_, prepared.inputs, prepared.outputs, *prepared.node);
-        sequence_->barrier();
-    }
-
-    sequence_->end();
-
-    // Execute
+    // Commands are pre-recorded in prepare(), just submit
     double timeMs = sequence_->submitAndWait();
 
     // Return output pointers

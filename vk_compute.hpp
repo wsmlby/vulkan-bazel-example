@@ -165,7 +165,8 @@ public:
     ~Sequence();
 
     // Start recording commands
-    void begin();
+    // Set reusable=true if you plan to submit the same commands multiple times
+    void begin(bool reusable = false);
     
     // Finish recording commands (must be called before submit)
     void end();

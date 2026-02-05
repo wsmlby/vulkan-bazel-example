@@ -472,10 +472,14 @@ Sequence::~Sequence() {
 }
 
 // Begin recording commands into the command buffer
-void Sequence::begin() {
+void Sequence::begin(bool reusable) {
     vkResetCommandBuffer(cmd_, 0);
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    // ONE_TIME_SUBMIT is a hint that the buffer will only be submitted once
+    // Omit it if we want to reuse the recorded commands multiple times
+    if (!reusable) {
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    }
     check(vkBeginCommandBuffer(cmd_, &beginInfo), "Failed to begin cmd buffer");
 }
 

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <chrono>
+#include <limits>
 
 // ============================================================================
 // YOLOv5 Preprocessing - Letterbox resize
@@ -432,6 +434,27 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+        // Benchmark loop: run 10 iterations and record lowest time
+        const int benchmarkIterations = 10;
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Running benchmark: " << benchmarkIterations << " iterations..." << std::endl;
+        std::cout << "========================================" << std::endl;
+        
+        double lowestMs = std::numeric_limits<double>::max();
+        
+        for (int iter = 0; iter < benchmarkIterations; iter++) {
+            double iterMs = executor.runTimed(inputs, outputs);
+            std::cout << "  Iteration " << (iter + 1) << ": " << std::fixed << std::setprecision(2) << iterMs << " ms" << std::endl;
+            if (iterMs < lowestMs) {
+                lowestMs = iterMs;
+            }
+        }
+        
+        double fps = 1000.0 / lowestMs;
+        
+        std::cout << "Lowest time: " << std::fixed << std::setprecision(2) << lowestMs << " ms" << std::endl;
+        std::cout << "Best FPS: " << std::fixed << std::setprecision(2) << fps << std::endl;
 
         std::cout << "\nDone!" << std::endl;
         return 0;
