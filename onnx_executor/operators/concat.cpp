@@ -49,21 +49,43 @@ void ConcatOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inpu
 
 void ConcatOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
                       const std::vector<Tensor*>& outputs, const Node& node) {
-    // Use buffer copies for concatenation
-    // This is correct for concat along axis 0, or when lower dims are all 1
     VkCommandBuffer cmd = seq.cmdBuffer();
     
-    size_t dstOffset = 0;
-    for (size_t i = 0; i < inputBuffers_.size(); i++) {
-        size_t size = inputInfos_[i].elementCount * sizeof(float);
+    const auto& outShape = outputs[0]->shape();
+    int64_t axis = axis_;
+    
+    // Calculate sizes for proper concatenation
+    // innerSize: number of elements in dimensions after axis (stride for axis)
+    // outerSize: number of elements in dimensions before axis
+    int64_t innerSize = 1;
+    for (size_t i = axis + 1; i < outShape.size(); i++) {
+        innerSize *= outShape[i];
+    }
+    
+    int64_t outerSize = 1;
+    for (size_t i = 0; i < (size_t)axis; i++) {
+        outerSize *= outShape[i];
+    }
+    
+    // For each outer position, copy each input's slice at axis position
+    for (int64_t outer = 0; outer < outerSize; outer++) {
+        VkDeviceSize dstOffset = outer * outShape[axis] * innerSize * sizeof(float);
         
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = dstOffset;
-        copyRegion.size = size;
-        vkCmdCopyBuffer(cmd, inputBuffers_[i]->buffer, outputBuffer_->buffer, 1, &copyRegion);
-        
-        dstOffset += size;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            const auto& inShape = inputs[i]->shape();
+            int64_t axisSize = inShape[axis];
+            VkDeviceSize copySize = axisSize * innerSize * sizeof(float);
+            
+            VkDeviceSize srcOffset = outer * axisSize * innerSize * sizeof(float);
+            
+            VkBufferCopy copyRegion{};
+            copyRegion.srcOffset = srcOffset;
+            copyRegion.dstOffset = dstOffset;
+            copyRegion.size = copySize;
+            vkCmdCopyBuffer(cmd, inputs[i]->buffer().buffer, outputBuffer_->buffer, 1, &copyRegion);
+            
+            dstOffset += copySize;
+        }
     }
 }
 

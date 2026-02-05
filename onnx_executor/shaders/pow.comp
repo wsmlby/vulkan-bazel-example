@@ -5,9 +5,9 @@ layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
     uint totalElements;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint aElements;
+    uint bElements;
+    uint pad;
 } params;
 
 layout(binding = 0) readonly buffer InputA { float a[]; };
@@ -17,5 +17,8 @@ layout(binding = 2) writeonly buffer Output { float c[]; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= params.totalElements) return;
-    c[idx] = pow(a[idx], b[idx]);
+    // Handle broadcasting: use modulo for smaller arrays
+    uint aIdx = (params.aElements == params.totalElements) ? idx : (idx % params.aElements);
+    uint bIdx = (params.bElements == params.totalElements) ? idx : (idx % params.bElements);
+    c[idx] = pow(a[aIdx], b[bIdx]);
 }

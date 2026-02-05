@@ -74,15 +74,19 @@ void ConvOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs
 
     std::string shaderPath = shaderDir + "/conv2d_shader.spv";
 
-    // Buffers: input, weight, output (bias handled separately if present)
+    // Number of bindings: input, weight, output, bias (4 total)
+    int numBindings = params_.hasBias ? 4 : 3;
     pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
-        ctx, shaderPath, 3, 256, sizeof(Conv2DParams));
+        ctx, shaderPath, numBindings, 256, sizeof(Conv2DParams));
 
-    // Bind buffers: input, weight, output
+    // Bind buffers: input, weight, output, [bias]
     std::vector<vkcompute::Buffer*> buffers;
     buffers.push_back(&inputs[0]->buffer());  // input
     buffers.push_back(&inputs[1]->buffer());  // weight
     buffers.push_back(&outputs[0]->buffer()); // output
+    if (params_.hasBias) {
+        buffers.push_back(&inputs[2]->buffer());  // bias
+    }
     pipeline_->bindBuffers(buffers);
 }
 

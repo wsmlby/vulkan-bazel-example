@@ -26,6 +26,7 @@ layout(push_constant) uniform PushConstants {
 layout(binding = 0) readonly buffer Input { float input_data[]; };
 layout(binding = 1) readonly buffer Weight { float weight_data[]; };
 layout(binding = 2) writeonly buffer Output { float output_data[]; };
+layout(binding = 3) readonly buffer Bias { float bias_data[]; };
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -70,6 +71,11 @@ void main() {
                 }
             }
         }
+    }
+
+    // Add bias if present
+    if (params.hasBias != 0u) {
+        sum += bias_data[k];
     }
 
     // Output index: [n, k, oh, ow]

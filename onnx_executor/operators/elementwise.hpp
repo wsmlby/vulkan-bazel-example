@@ -5,10 +5,12 @@
 
 namespace onnxrt {
 
-// Push constants for elementwise binary ops
+// Push constants for elementwise binary ops with broadcasting
 struct BinaryOpParams {
     uint32_t totalElements;
-    uint32_t pad[3];  // Padding to 16 bytes
+    uint32_t aElements;
+    uint32_t bElements;
+    uint32_t pad;
 };
 
 // Push constants for elementwise unary ops
@@ -45,6 +47,7 @@ public:
 private:
     std::unique_ptr<vkcompute::ComputePipeline> pipeline_;
     uint32_t totalElements_ = 0;
+    uint32_t aElements_ = 0;
     uint32_t bElements_ = 0;
 };
 
@@ -75,6 +78,7 @@ public:
 private:
     std::unique_ptr<vkcompute::ComputePipeline> pipeline_;
     uint32_t totalElements_ = 0;
+    uint32_t aElements_ = 0;
     uint32_t bElements_ = 0;
 };
 
@@ -105,6 +109,7 @@ public:
 private:
     std::unique_ptr<vkcompute::ComputePipeline> pipeline_;
     uint32_t totalElements_ = 0;
+    uint32_t aElements_ = 0;
     uint32_t bElements_ = 0;
 };
 

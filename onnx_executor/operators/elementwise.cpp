@@ -37,6 +37,8 @@ void AddOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
                     const std::vector<Tensor*>& outputs, const Node& node,
                     const std::string& shaderDir) {
     totalElements_ = static_cast<uint32_t>(outputs[0]->elementCount());
+    aElements_ = static_cast<uint32_t>(inputs[0]->elementCount());
+    bElements_ = static_cast<uint32_t>(inputs[1]->elementCount());
 
     std::string shaderPath = shaderDir + "/add_shader.spv";
     pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
@@ -47,7 +49,7 @@ void AddOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
 
 void AddOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& outputs, const Node& node) {
-    BinaryOpParams params{totalElements_, {0, 0, 0}};
+    BinaryOpParams params{totalElements_, aElements_, bElements_, 0};
     pipeline_->setPushConstants(&params, sizeof(params));
 
     uint32_t numGroups = (totalElements_ + 255) / 256;
@@ -71,6 +73,8 @@ void MulOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
                     const std::vector<Tensor*>& outputs, const Node& node,
                     const std::string& shaderDir) {
     totalElements_ = static_cast<uint32_t>(outputs[0]->elementCount());
+    aElements_ = static_cast<uint32_t>(inputs[0]->elementCount());
+    bElements_ = static_cast<uint32_t>(inputs[1]->elementCount());
 
     std::string shaderPath = shaderDir + "/mul_shader.spv";
     pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
@@ -81,7 +85,7 @@ void MulOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
 
 void MulOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& outputs, const Node& node) {
-    BinaryOpParams params{totalElements_, {0, 0, 0}};
+    BinaryOpParams params{totalElements_, aElements_, bElements_, 0};
     pipeline_->setPushConstants(&params, sizeof(params));
 
     uint32_t numGroups = (totalElements_ + 255) / 256;
@@ -105,6 +109,8 @@ void PowOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
                     const std::vector<Tensor*>& outputs, const Node& node,
                     const std::string& shaderDir) {
     totalElements_ = static_cast<uint32_t>(outputs[0]->elementCount());
+    aElements_ = static_cast<uint32_t>(inputs[0]->elementCount());
+    bElements_ = static_cast<uint32_t>(inputs[1]->elementCount());
 
     std::string shaderPath = shaderDir + "/pow_shader.spv";
     pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
@@ -115,7 +121,7 @@ void PowOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inputs,
 
 void PowOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& outputs, const Node& node) {
-    BinaryOpParams params{totalElements_, {0, 0, 0}};
+    BinaryOpParams params{totalElements_, aElements_, bElements_, 0};
     pipeline_->setPushConstants(&params, sizeof(params));
 
     uint32_t numGroups = (totalElements_ + 255) / 256;

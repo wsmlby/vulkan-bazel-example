@@ -46,7 +46,11 @@ LetterboxInfo yoloPreprocess(
     }
     
     // Resize and place image with bilinear interpolation
+    // BGR channel mapping to RGB: input channel 0->2, 1->1, 2->0
+    const int bgrToRgb[3] = {2, 1, 0};
+    
     for (int c = 0; c < 3; c++) {
+        int srcChannel = bgrToRgb[c];  // Convert BGR input to RGB output
         for (int y = 0; y < info.newHeight; y++) {
             for (int x = 0; x < info.newWidth; x++) {
                 // Map to source coordinates
@@ -60,15 +64,15 @@ LetterboxInfo yoloPreprocess(
                 float fx = srcX - x0;
                 float fy = srcY - y0;
                 
-                // Bilinear interpolation (input is HWC)
+                // Bilinear interpolation (input is HWC BGR format)
                 auto getPixel = [&](int py, int px, int ch) -> float {
                     return rawData[(py * srcWidth + px) * 3 + ch] / 255.0f;
                 };
                 
-                float v = getPixel(y0, x0, c) * (1-fx) * (1-fy) +
-                          getPixel(y0, x1, c) * fx * (1-fy) +
-                          getPixel(y1, x0, c) * (1-fx) * fy +
-                          getPixel(y1, x1, c) * fx * fy;
+                float v = getPixel(y0, x0, srcChannel) * (1-fx) * (1-fy) +
+                          getPixel(y0, x1, srcChannel) * fx * (1-fy) +
+                          getPixel(y1, x0, srcChannel) * (1-fx) * fy +
+                          getPixel(y1, x1, srcChannel) * fx * fy;
                 
                 // Output is NCHW
                 int outY = y + info.padTop;
@@ -168,7 +172,18 @@ std::vector<Detection> yoloPostprocess(
         std::cout << std::endl;
     }
     
-    // Check coordinate range among confident detections
+    // Debug: check specific anchor to compare with Python (anchor 15739)
+    {
+        const float* det = output + 15739 * numValues;
+        std::cout << "  Anchor 15739: cx=" << det[0] << " cy=" << det[1] 
+                  << " w=" << det[2] << " h=" << det[3] << " obj=" << det[4];
+        for (int c = 0; c < numClasses; c++) {
+            std::cout << " c" << c << "=" << std::setprecision(6) << det[5+c];
+        }
+        std::cout << std::endl;
+    }
+    
+    // Check coordinate range among confident detections (for debug only)
     float maxX = 0, maxY = 0, maxW = 0, maxH = 0;
     int validCount = 0;
     for (int i = 0; i < numDetections; i++) {
@@ -182,6 +197,7 @@ std::vector<Detection> yoloPostprocess(
     }
     
     // Determine if coordinates are normalized (0-1) or absolute pixels
+    // Note: Vulkan executor outputs normalized, ONNX Runtime outputs pixels
     bool isNormalized = (maxX <= 1.5f && maxY <= 1.5f);
     std::cout << "  Coordinate format: " << (isNormalized ? "normalized" : "pixels") 
               << " (maxX=" << maxX << ", maxY=" << maxY << ")" << std::endl;
@@ -216,7 +232,7 @@ std::vector<Detection> yoloPostprocess(
         float w = det[2];
         float h = det[3];
         
-        // If normalized, convert to target image pixel space
+        // If normalized (Vulkan executor), convert to target image pixel space
         if (isNormalized) {
             cx *= targetWidth;
             cy *= targetHeight;
