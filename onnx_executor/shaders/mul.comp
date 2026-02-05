@@ -1,7 +1,10 @@
 #version 450
 
+// Vectorized Mul shader - processes 4 elements per thread
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
 layout(local_size_x_id = 0) in;
+
+const uint ELEMENTS_PER_THREAD = 4;
 
 layout(push_constant) uniform PushConstants {
     uint totalElements;
@@ -15,10 +18,33 @@ layout(binding = 1) readonly buffer InputB { float b[]; };
 layout(binding = 2) writeonly buffer Output { float c[]; };
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= params.totalElements) return;
-    // Handle broadcasting: use modulo for smaller arrays
-    uint aIdx = (params.aElements == params.totalElements) ? idx : (idx % params.aElements);
-    uint bIdx = (params.bElements == params.totalElements) ? idx : (idx % params.bElements);
-    c[idx] = a[aIdx] * b[bIdx];
+    uint baseIdx = gl_GlobalInvocationID.x * ELEMENTS_PER_THREAD;
+    
+    bool aFull = (params.aElements == params.totalElements);
+    bool bFull = (params.bElements == params.totalElements);
+    bool aScalar = (params.aElements == 1);
+    bool bScalar = (params.bElements == 1);
+    
+    if (aFull && bFull) {
+        for (uint i = 0; i < ELEMENTS_PER_THREAD && baseIdx + i < params.totalElements; i++) {
+            c[baseIdx + i] = a[baseIdx + i] * b[baseIdx + i];
+        }
+    } else if (aFull && bScalar) {
+        float bVal = b[0];
+        for (uint i = 0; i < ELEMENTS_PER_THREAD && baseIdx + i < params.totalElements; i++) {
+            c[baseIdx + i] = a[baseIdx + i] * bVal;
+        }
+    } else if (aScalar && bFull) {
+        float aVal = a[0];
+        for (uint i = 0; i < ELEMENTS_PER_THREAD && baseIdx + i < params.totalElements; i++) {
+            c[baseIdx + i] = aVal * b[baseIdx + i];
+        }
+    } else {
+        for (uint i = 0; i < ELEMENTS_PER_THREAD && baseIdx + i < params.totalElements; i++) {
+            uint idx = baseIdx + i;
+            uint aIdx = aFull ? idx : (idx % params.aElements);
+            uint bIdx = bFull ? idx : (idx % params.bElements);
+            c[idx] = a[aIdx] * b[bIdx];
+        }
+    }
 }

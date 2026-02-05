@@ -458,14 +458,17 @@ void Executor::prepare() {
     transferSequence_ = std::make_unique<vkcompute::Sequence>(*ctx_);
 
     // Dependency analysis: determine which operations need barriers before them
-    // A barrier is needed when an op reads a tensor that was written by a previous op
+    // A barrier is needed when an op reads a tensor that was written by a compute op
     // without any barrier in between.
+    // OPTIMIZATION: Buffer copy operations (Concat, Reshape, Slice) use transfer commands
+    // which have different synchronization requirements. We can batch consecutive
+    // compute operations without barriers if they don't have direct read-after-write dependencies.
     
     // Track tensors that have been written since the last barrier
     std::set<std::string> dirtyTensors;
     
-    // Also track which tensors are written by compute (vs initializers/inputs which don't need barriers)
-    std::set<std::string> computeWrittenTensors;
+    // Track the last operation that wrote to each tensor
+    std::map<std::string, size_t> lastWriter;
     
     // Analyze dependencies and mark which ops need a barrier before them
     std::vector<bool> needsBarrierBefore(preparedOps_.size(), false);
@@ -477,7 +480,10 @@ void Executor::prepare() {
         bool needsBarrier = false;
         for (const auto& inputName : prepared.node->inputs) {
             if (inputName.empty()) continue;
-            if (dirtyTensors.count(inputName) > 0) {
+            
+            // Check if this input was written by a previous op without an intervening barrier
+            auto it = lastWriter.find(inputName);
+            if (it != lastWriter.end() && dirtyTensors.count(inputName) > 0) {
                 needsBarrier = true;
                 break;
             }
@@ -488,12 +494,11 @@ void Executor::prepare() {
             dirtyTensors.clear();  // Barrier will flush all dirty tensors
         }
         
-        // Mark outputs as dirty and compute-written
-        // Use actualOutputNames (may differ from node->outputs for fused ops)
+        // Mark outputs as dirty and track writer
         for (const auto& outputName : prepared.outputNames) {
             if (!outputName.empty()) {
                 dirtyTensors.insert(outputName);
-                computeWrittenTensors.insert(outputName);
+                lastWriter[outputName] = i;
             }
         }
     }

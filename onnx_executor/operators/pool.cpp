@@ -37,8 +37,11 @@ void MaxPoolOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& inp
 void MaxPoolOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
                        const std::vector<Tensor*>& outputs, const Node& node) {
     pipeline_->setPushConstants(&params_, sizeof(params_));
+    // Each thread processes TILE_SIZE=4 outputs
+    const uint32_t TILE_SIZE = 4;
     uint32_t total = params_.N * params_.C * params_.outH * params_.outW;
-    pipeline_->recordTo(seq.cmdBuffer(), (total + 255) / 256);
+    uint32_t numTiles = (total + TILE_SIZE - 1) / TILE_SIZE;
+    pipeline_->recordTo(seq.cmdBuffer(), (numTiles + 255) / 256);
 }
 
 REGISTER_OPERATOR("MaxPool", MaxPoolOp);

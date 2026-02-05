@@ -53,6 +53,20 @@ void ConvSiluOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& in
     pipeline_->bindBuffers(buffers);
 }
 
+void ConvSiluOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
+                        const std::vector<Tensor*>& outputs, const Node& node) {
+    pipeline_->setPushConstants(&params_, sizeof(params_));
+
+    // Dispatch with 2D tiling: TILE_OW=4 pixels x TILE_K=4 channels per thread
+    const uint32_t TILE_OW = 4;
+    const uint32_t TILE_K = 4;
+    uint32_t tiledOutW = (params_.outW + TILE_OW - 1) / TILE_OW;
+    uint32_t tiledK = (params_.K + TILE_K - 1) / TILE_K;
+    uint32_t totalTiles = params_.N * tiledK * params_.outH * tiledOutW;
+    uint32_t numGroups = (totalTiles + 255) / 256;
+    pipeline_->recordTo(seq.cmdBuffer(), numGroups);
+}
+
 REGISTER_OPERATOR("ConvSilu", ConvSiluOp);
 
 } // namespace onnxrt

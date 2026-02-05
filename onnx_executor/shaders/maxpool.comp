@@ -2,6 +2,9 @@
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 256;
 layout(local_size_x_id = 0) in;
 
+// Process multiple outputs per thread for better efficiency
+const uint TILE_SIZE = 4;
+
 layout(push_constant) uniform PC {
     uint N, C, H, W;
     uint outH, outW;
@@ -15,24 +18,35 @@ layout(binding = 1) writeonly buffer Output { float output_data[]; };
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint total = p.N * p.C * p.outH * p.outW;
+    uint total = (p.N * p.C * p.outH * p.outW + TILE_SIZE - 1) / TILE_SIZE;
     if (idx >= total) return;
 
-    uint ow = idx % p.outW;
-    uint oh = (idx / p.outW) % p.outH;
-    uint c = (idx / (p.outW * p.outH)) % p.C;
-    uint n = idx / (p.outW * p.outH * p.C);
+    uint baseIdx = idx * TILE_SIZE;
+    
+    for (uint t = 0; t < TILE_SIZE; t++) {
+        uint linearIdx = baseIdx + t;
+        if (linearIdx >= p.N * p.C * p.outH * p.outW) break;
+        
+        uint ow = linearIdx % p.outW;
+        uint oh = (linearIdx / p.outW) % p.outH;
+        uint c = (linearIdx / (p.outW * p.outH)) % p.C;
+        uint n = linearIdx / (p.outW * p.outH * p.C);
 
-    float maxVal = -1e38;
-    for (uint kh = 0; kh < p.kH; kh++) {
-        for (uint kw = 0; kw < p.kW; kw++) {
+        float maxVal = -1e38;
+        uint inputBase = n * p.C * p.H * p.W + c * p.H * p.W;
+        
+        for (uint kh = 0; kh < p.kH; kh++) {
             int ih = int(oh * p.strideH) - int(p.padH) + int(kh);
-            int iw = int(ow * p.strideW) - int(p.padW) + int(kw);
-            if (ih >= 0 && ih < int(p.H) && iw >= 0 && iw < int(p.W)) {
-                uint inputIdx = n * p.C * p.H * p.W + c * p.H * p.W + uint(ih) * p.W + uint(iw);
-                maxVal = max(maxVal, input_data[inputIdx]);
+            if (ih >= 0 && ih < int(p.H)) {
+                for (uint kw = 0; kw < p.kW; kw++) {
+                    int iw = int(ow * p.strideW) - int(p.padW) + int(kw);
+                    if (iw >= 0 && iw < int(p.W)) {
+                        uint inputIdx = inputBase + uint(ih) * p.W + uint(iw);
+                        maxVal = max(maxVal, input_data[inputIdx]);
+                    }
+                }
             }
         }
+        output_data[linearIdx] = maxVal;
     }
-    output_data[idx] = maxVal;
 }

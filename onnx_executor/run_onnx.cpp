@@ -9,6 +9,7 @@
 #include <vector>
 #include <chrono>
 #include <limits>
+#include <random>
 
 // ============================================================================
 // YOLOv5 Preprocessing - Letterbox resize
@@ -515,26 +516,111 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Benchmark loop: run 10 iterations and record lowest time
-        const int benchmarkIterations = 10;
-        std::cout << "\n========================================" << std::endl;
-        std::cout << "Running benchmark: " << benchmarkIterations << " iterations..." << std::endl;
-        std::cout << "========================================" << std::endl;
-        
-        double lowestMs = std::numeric_limits<double>::max();
-        
-        for (int iter = 0; iter < benchmarkIterations; iter++) {
-            double iterMs = executor.runTimed(inputs, outputs);
-            std::cout << "  Iteration " << (iter + 1) << ": " << std::fixed << std::setprecision(2) << iterMs << " ms" << std::endl;
-            if (iterMs < lowestMs) {
-                lowestMs = iterMs;
+        // Pre-generate random warmup data (do this before any timing)
+        std::vector<float> randomInputData;
+        {
+            size_t totalElements = 0;
+            for (const auto& [name, tensor] : inputs) {
+                if (tensor.isPinned()) totalElements += tensor.elementCount();
+            }
+            randomInputData.resize(totalElements);
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+            for (size_t i = 0; i < totalElements; i++) {
+                randomInputData[i] = dist(rng);
             }
         }
         
-        double fps = 1000.0 / lowestMs;
+        // Also save the real input data
+        std::vector<float> realInputData;
+        {
+            size_t totalElements = 0;
+            for (const auto& [name, tensor] : inputs) {
+                if (tensor.isPinned()) totalElements += tensor.elementCount();
+            }
+            realInputData.resize(totalElements);
+            size_t offset = 0;
+            for (const auto& [name, tensor] : inputs) {
+                if (!tensor.isPinned()) continue;
+                size_t count = tensor.elementCount();
+                std::memcpy(realInputData.data() + offset, tensor.data<float>(), count * sizeof(float));
+                offset += count;
+            }
+        }
+
+        auto copyInputsFrom = [&](const std::vector<float>& src) {
+            size_t offset = 0;
+            for (auto& [name, tensor] : inputs) {
+                if (!tensor.isPinned()) continue;
+                size_t count = tensor.elementCount();
+                std::memcpy(tensor.data<float>(), src.data() + offset, count * sizeof(float));
+                offset += count;
+            }
+        };
+
+        // Warmup phase: use random data to avoid caching effects
+        const int warmupIterations = 100;
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Warming up GPU (" << warmupIterations << " iterations with random data)..." << std::endl;
+        std::cout << "========================================" << std::endl;
         
-        std::cout << "Lowest time: " << std::fixed << std::setprecision(2) << lowestMs << " ms" << std::endl;
-        std::cout << "Best FPS: " << std::fixed << std::setprecision(2) << fps << std::endl;
+        // Load random data into input tensors
+        copyInputsFrom(randomInputData);
+        
+        for (int iter = 0; iter < warmupIterations; iter++) {
+            copyInputsFrom(randomInputData);
+            executor.runTimed(inputs, outputs);
+            if ((iter + 1) % 20 == 0) {
+                std::cout << "  Warmup: " << (iter + 1) << "/" << warmupIterations << std::endl;
+            }
+        }
+        
+        // Restore real data for benchmark
+        copyInputsFrom(realInputData);
+
+        // Benchmark loop: run iterations and record statistics
+        const int benchmarkIterations = 200;
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Running benchmark: " << benchmarkIterations << " iterations (real data)..." << std::endl;
+        std::cout << "========================================" << std::endl;
+        
+        double lowestMs = std::numeric_limits<double>::max();
+        double totalMs = 0;
+        std::vector<double> times;
+        times.reserve(benchmarkIterations);
+        
+        for (int iter = 0; iter < benchmarkIterations; iter++) {
+            // Simulate real-world input upload by copying host data into pinned buffers each iteration
+            copyInputsFrom(realInputData);
+            auto start = std::chrono::high_resolution_clock::now();
+            executor.runTimed(inputs, outputs);
+            auto end = std::chrono::high_resolution_clock::now();
+            double iterMs = std::chrono::duration<double, std::milli>(end - start).count();
+            times.push_back(iterMs);
+            totalMs += iterMs;
+            if (iterMs < lowestMs) {
+                lowestMs = iterMs;
+            }
+            // Print every 20th iteration
+            if ((iter + 1) % 20 == 0) {
+                std::cout << "  Iteration " << (iter + 1) << ": " << std::fixed << std::setprecision(2) << iterMs << " ms" << std::endl;
+            }
+        }
+        
+        // Calculate statistics
+        double avgMs = totalMs / benchmarkIterations;
+        std::sort(times.begin(), times.end());
+        double medianMs = times[benchmarkIterations / 2];
+        double p99Ms = times[(int)(benchmarkIterations * 0.99)];
+        
+        double fps = 1000.0 / lowestMs;
+        double avgFps = 1000.0 / avgMs;
+        
+        std::cout << "\n--- Results (after warmup) ---" << std::endl;
+        std::cout << "Best:   " << std::fixed << std::setprecision(2) << lowestMs << " ms (" << fps << " FPS)" << std::endl;
+        std::cout << "Avg:    " << std::fixed << std::setprecision(2) << avgMs << " ms (" << avgFps << " FPS)" << std::endl;
+        std::cout << "Median: " << std::fixed << std::setprecision(2) << medianMs << " ms" << std::endl;
+        std::cout << "P99:    " << std::fixed << std::setprecision(2) << p99Ms << " ms" << std::endl;
 
         std::cout << "\nDone!" << std::endl;
         return 0;

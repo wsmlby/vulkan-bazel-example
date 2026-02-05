@@ -21,6 +21,12 @@ public:
         const std::vector<Tensor*>& outputs,
         const Node& node,
         const std::string& shaderDir) override;
+
+    void record(
+        vkcompute::Sequence& seq,
+        const std::vector<Tensor*>& inputs,
+        const std::vector<Tensor*>& outputs,
+        const Node& node) override;
 };
 
 } // namespace onnxrt

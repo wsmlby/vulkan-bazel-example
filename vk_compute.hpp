@@ -35,6 +35,10 @@ public:
     VkCommandBuffer transferCmd = VK_NULL_HANDLE;
     VkFence transferFence = VK_NULL_HANDLE;
 
+    // Timestamp support
+    bool timestampsSupported = false;
+    float timestampPeriod = 1.0f; // nanoseconds per tick
+
     // Create a Vulkan context, optionally filtering devices by name (e.g., "NVIDIA", "AMD", "Intel")
     Context(const std::string& preferredDevice = "");
     ~Context();
@@ -177,6 +181,15 @@ public:
     // Submit commands, wait for completion, and return execution time in milliseconds
     double submitAndWait();
 
+    // Enable GPU timestamp queries for profiling (must be called before begin)
+    void enableTimestamps(uint32_t queryCount);
+
+    // Write a GPU timestamp into the query pool at the given index
+    void writeTimestamp(uint32_t index);
+
+    // Fetch timestamp query results (nanoseconds ticks)
+    std::vector<uint64_t> fetchTimestamps() const;
+
     // Record a compute shader dispatch
     // groupCount parameters specify the number of workgroups in each dimension
     void record(ComputePipeline& pipeline, uint32_t groupCountX, uint32_t groupCountY = 1, uint32_t groupCountZ = 1);
@@ -201,6 +214,11 @@ private:
     Context* ctx = nullptr;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+
+    // Timestamp query pool
+    VkQueryPool queryPool_ = VK_NULL_HANDLE;
+    uint32_t queryCount_ = 0;
+    bool timestampsEnabled_ = false;
 };
 
 } // namespace vkcompute

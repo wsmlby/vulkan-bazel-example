@@ -79,8 +79,12 @@ Context::Context(const std::string& preferredDevice) {
         else throw std::runtime_error("No compute-capable device found matching filter: " + preferredDevice);
     }
 
-    // Query memory properties for later memory allocation
+    // Query memory properties and device limits for later use
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physicalDevice, &props);
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+    timestampsSupported = props.limits.timestampComputeAndGraphics == VK_TRUE;
+    timestampPeriod = props.limits.timestampPeriod;
 
     // Create logical device with one compute queue
     float priority = 1.0f;
@@ -99,6 +103,7 @@ Context::Context(const std::string& preferredDevice) {
     // Create command pool for allocating command buffers
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.queueFamilyIndex = queueFamily;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     check(vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool), "Failed to create command pool");
     
     // Create reusable transfer command buffer (used by Buffer::copyFrom)
@@ -466,6 +471,7 @@ Sequence::Sequence(Context& context) : ctx(&context) {
 
 Sequence::~Sequence() {
     if (ctx && ctx->device) {
+        if (queryPool_) vkDestroyQueryPool(ctx->device, queryPool_, nullptr);
         if (cmd_) vkFreeCommandBuffers(ctx->device, ctx->cmdPool, 1, &cmd_);
         if (fence) vkDestroyFence(ctx->device, fence, nullptr);
     }
@@ -481,6 +487,10 @@ void Sequence::begin(bool reusable) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     }
     check(vkBeginCommandBuffer(cmd_, &beginInfo), "Failed to begin cmd buffer");
+
+    if (timestampsEnabled_ && queryPool_) {
+        vkCmdResetQueryPool(cmd_, queryPool_, 0, queryCount_);
+    }
 }
 
 // Finish recording commands
@@ -508,6 +518,49 @@ double Sequence::submitAndWait() {
     auto end = std::chrono::high_resolution_clock::now();
     
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void Sequence::enableTimestamps(uint32_t queryCount) {
+    if (!ctx || !ctx->device) return;
+    if (!ctx->timestampsSupported) {
+        throw std::runtime_error("Timestamps not supported on this device");
+    }
+
+    if (queryPool_) {
+        vkDestroyQueryPool(ctx->device, queryPool_, nullptr);
+        queryPool_ = VK_NULL_HANDLE;
+    }
+
+    VkQueryPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    poolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    poolInfo.queryCount = queryCount;
+    check(vkCreateQueryPool(ctx->device, &poolInfo, nullptr, &queryPool_), "Failed to create query pool");
+    queryCount_ = queryCount;
+    timestampsEnabled_ = true;
+}
+
+void Sequence::writeTimestamp(uint32_t index) {
+    if (!timestampsEnabled_ || !queryPool_) return;
+    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, index);
+}
+
+std::vector<uint64_t> Sequence::fetchTimestamps() const {
+    std::vector<uint64_t> results;
+    if (!timestampsEnabled_ || !queryPool_ || queryCount_ == 0) return results;
+    results.resize(queryCount_);
+    VkResult res = vkGetQueryPoolResults(
+        ctx->device,
+        queryPool_,
+        0,
+        queryCount_,
+        sizeof(uint64_t) * results.size(),
+        results.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("Failed to get query pool results");
+    }
+    return results;
 }
 
 // Record a compute dispatch (delegates to pipeline's recordTo method)

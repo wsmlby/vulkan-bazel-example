@@ -52,7 +52,10 @@ void AddOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
     BinaryOpParams params{totalElements_, aElements_, bElements_, 0};
     pipeline_->setPushConstants(&params, sizeof(params));
 
-    uint32_t numGroups = (totalElements_ + 255) / 256;
+    // Each thread processes 4 elements
+    const uint32_t ELEMENTS_PER_THREAD = 4;
+    uint32_t numThreads = (totalElements_ + ELEMENTS_PER_THREAD - 1) / ELEMENTS_PER_THREAD;
+    uint32_t numGroups = (numThreads + 255) / 256;
     pipeline_->recordTo(seq.cmdBuffer(), numGroups);
 }
 
@@ -88,7 +91,10 @@ void MulOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& inputs,
     BinaryOpParams params{totalElements_, aElements_, bElements_, 0};
     pipeline_->setPushConstants(&params, sizeof(params));
 
-    uint32_t numGroups = (totalElements_ + 255) / 256;
+    // Each thread processes 4 elements
+    const uint32_t ELEMENTS_PER_THREAD = 4;
+    uint32_t numThreads = (totalElements_ + ELEMENTS_PER_THREAD - 1) / ELEMENTS_PER_THREAD;
+    uint32_t numGroups = (numThreads + 255) / 256;
     pipeline_->recordTo(seq.cmdBuffer(), numGroups);
 }
 
