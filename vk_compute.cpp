@@ -18,9 +18,9 @@ void check(VkResult result, const char* msg) {
 // ============================================================================
 
 Context::Context(const std::string& preferredDevice) {
-    // Create Vulkan instance - minimal setup, no validation layers or extensions
+    // Create Vulkan instance (Vulkan 1.1 for extension feature queries)
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    appInfo.apiVersion = VK_API_VERSION_1_0;
+    appInfo.apiVersion = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &appInfo;
@@ -86,6 +86,27 @@ Context::Context(const std::string& preferredDevice) {
     timestampsSupported = props.limits.timestampComputeAndGraphics == VK_TRUE;
     timestampPeriod = props.limits.timestampPeriod;
 
+    // Check for VK_KHR_cooperative_matrix extension
+    bool hasCoopMatrix = false;
+    {
+        uint32_t extCount = 0;
+        vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+        std::cout << "Device extensions (" << extCount << " total), looking for: "
+                  << VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME << std::endl;
+        for (const auto& ext : exts) {
+            if (std::string(ext.extensionName) == VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) {
+                hasCoopMatrix = true;
+                std::cout << "  Found: " << ext.extensionName << " (rev " << ext.specVersion << ")" << std::endl;
+                break;
+            }
+        }
+        if (!hasCoopMatrix) {
+            std::cout << "  VK_KHR_cooperative_matrix NOT found in device extensions" << std::endl;
+        }
+    }
+
     // Create logical device with one compute queue
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -96,9 +117,79 @@ Context::Context(const std::string& preferredDevice) {
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
+
+    // Enable cooperative matrix extension if available
+    std::vector<const char*> enabledExtensions;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatFeatures{};
+    coopMatFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    coopMatFeatures.cooperativeMatrix = VK_TRUE;
+
+    if (hasCoopMatrix) {
+        enabledExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = enabledExtensions.data();
+        deviceInfo.pNext = &coopMatFeatures;
+    }
+
     check(vkCreateDevice(physicalDevice, &deviceInfo, nullptr, &device), "Failed to create device");
 
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
+
+    // Query cooperative matrix properties if extension is enabled
+    if (hasCoopMatrix) {
+        auto vkGetCoopMatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+
+        std::cout << "CoopMat: function pointer = " << (vkGetCoopMatProps ? "OK" : "NULL") << std::endl;
+
+        if (vkGetCoopMatProps) {
+            uint32_t propCount = 0;
+            vkGetCoopMatProps(physicalDevice, &propCount, nullptr);
+            std::cout << "CoopMat: " << propCount << " property configs reported" << std::endl;
+
+            std::vector<VkCooperativeMatrixPropertiesKHR> coopProps(propCount);
+            for (auto& p : coopProps) {
+                p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                p.pNext = nullptr;
+            }
+            vkGetCoopMatProps(physicalDevice, &propCount, coopProps.data());
+
+            for (const auto& p : coopProps) {
+                std::cout << "CoopMat config: M=" << p.MSize << " N=" << p.NSize << " K=" << p.KSize
+                          << " A=" << p.AType << " B=" << p.BType
+                          << " C=" << p.CType << " Result=" << p.ResultType
+                          << " scope=" << p.scope << std::endl;
+                if (p.scope != VK_SCOPE_SUBGROUP_KHR) continue;
+
+                // Prefer: fp16 A/B with fp32 C/Result (mixed precision tensor cores)
+                if (p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                    p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                    coopMatConfigs.push_back({p.MSize, p.NSize, p.KSize, true});
+                    coopMatrixSupported = true;
+                }
+                // Also accept: pure fp32 (if available)
+                else if (p.AType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                         p.BType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                         p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                         p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                    coopMatConfigs.push_back({p.MSize, p.NSize, p.KSize, false});
+                    coopMatrixSupported = true;
+                }
+            }
+
+            if (coopMatrixSupported) {
+                std::cout << "Cooperative matrix configs:" << std::endl;
+                for (const auto& c : coopMatConfigs) {
+                    std::cout << "  M=" << c.MSize << " N=" << c.NSize << " K=" << c.KSize
+                              << (c.mixedPrecision ? " (fp16 in, fp32 acc)" : " (fp32)") << std::endl;
+                }
+            } else {
+                std::cout << "Cooperative matrix: no compatible configs found" << std::endl;
+            }
+        }
+    }
 
     // Create command pool for allocating command buffers
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -293,7 +384,7 @@ ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, u
           "Failed to create shader module");
     auto compileEnd = std::chrono::high_resolution_clock::now();
     double compileTimeMs = std::chrono::duration<double, std::milli>(compileEnd - compileStart).count();
-    std::cout << "Shader compile time: " << compileTimeMs << " ms" << std::endl;
+    // std::cout << "Shader compile time: " << compileTimeMs << " ms" << std::endl;
 
     // Create descriptor set layout with N storage buffer bindings
     std::vector<VkDescriptorSetLayoutBinding> bindings(bufferCount);
@@ -363,6 +454,105 @@ ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, u
           "Failed to create descriptor pool");
 
     // Allocate descriptor set (will be populated later via bindBuffers)
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = descPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &descLayout;
+    check(vkAllocateDescriptorSets(ctx->device, &allocInfo, &descSet),
+          "Failed to allocate descriptor set");
+}
+
+// Constructor with multiple specialization constants
+ComputePipeline::ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount,
+                                 const std::vector<uint32_t>& specConstants, uint32_t pushConstantSize)
+    : ctx(&context), pushConstantSize_(pushConstantSize) {
+
+    // Load compiled SPIR-V shader from file
+    std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("Failed to open shader: " + spvPath);
+    size_t fileSize = file.tellg();
+    std::vector<uint32_t> code(fileSize / 4);
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(code.data()), fileSize);
+
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = code.size() * 4;
+    moduleInfo.pCode = code.data();
+    auto compileStart = std::chrono::high_resolution_clock::now();
+    check(vkCreateShaderModule(ctx->device, &moduleInfo, nullptr, &shaderModule),
+          "Failed to create shader module");
+    auto compileEnd = std::chrono::high_resolution_clock::now();
+    double compileTimeMs = std::chrono::duration<double, std::milli>(compileEnd - compileStart).count();
+    // std::cout << "Shader compile time: " << compileTimeMs << " ms" << std::endl;
+
+    // Create descriptor set layout
+    std::vector<VkDescriptorSetLayoutBinding> bindings(bufferCount);
+    for (uint32_t i = 0; i < bufferCount; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = bufferCount;
+    layoutInfo.pBindings = bindings.data();
+    check(vkCreateDescriptorSetLayout(ctx->device, &layoutInfo, nullptr, &descLayout),
+          "Failed to create descriptor layout");
+
+    // Create pipeline layout with optional push constants
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = pushConstantSize_;
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &descLayout;
+    if (pushConstantSize_ > 0) {
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+        pushConstantData_.resize(pushConstantSize_);
+    }
+    check(vkCreatePipelineLayout(ctx->device, &pipelineLayoutInfo, nullptr, &pipelineLayout),
+          "Failed to create pipeline layout");
+
+    // Set up multiple specialization constants (constant_id = 0, 1, 2, ...)
+    std::vector<VkSpecializationMapEntry> specEntries(specConstants.size());
+    for (size_t i = 0; i < specConstants.size(); i++) {
+        specEntries[i].constantID = static_cast<uint32_t>(i);
+        specEntries[i].offset = static_cast<uint32_t>(i * sizeof(uint32_t));
+        specEntries[i].size = sizeof(uint32_t);
+    }
+
+    VkSpecializationInfo specInfo{};
+    specInfo.mapEntryCount = static_cast<uint32_t>(specEntries.size());
+    specInfo.pMapEntries = specEntries.data();
+    specInfo.dataSize = specConstants.size() * sizeof(uint32_t);
+    specInfo.pData = specConstants.data();
+
+    // Create compute pipeline
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+    stageInfo.pSpecializationInfo = &specInfo;
+
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = stageInfo;
+    pipelineInfo.layout = pipelineLayout;
+    check(vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline),
+          "Failed to create compute pipeline");
+
+    // Create descriptor pool and allocate descriptor set
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bufferCount};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    check(vkCreateDescriptorPool(ctx->device, &poolInfo, nullptr, &descPool),
+          "Failed to create descriptor pool");
+
     VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = descPool;
     allocInfo.descriptorSetCount = 1;

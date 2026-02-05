@@ -2,6 +2,7 @@
 #include "operators/operator_registry.hpp"
 #include "operators/register_all.hpp"
 #include <iostream>
+#include <iomanip>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -562,22 +563,161 @@ double Executor::runTimed(std::map<std::string, Tensor>& inputs,
 std::map<std::string, double> Executor::runProfile(std::map<std::string, Tensor>& inputs) {
     std::map<std::string, double> timings;
     
-    // Count operators by type
-    std::map<std::string, int> opCounts;
-    for (const auto& prepared : preparedOps_) {
-        opCounts[prepared.node->opType]++;
+    // Create a profiling sequence with timestamps
+    vkcompute::Sequence profileSeq(*ctx_);
+    
+    // Enable timestamps: we need 2 timestamps per operator (before and after)
+    // Plus 1 at the very beginning
+    uint32_t numTimestamps = preparedOps_.size() * 2 + 1;
+    profileSeq.enableTimestamps(numTimestamps);
+    
+    // Record input copies first
+    transferSequence_->begin();
+    for (auto& [name, userTensor] : inputs) {
+        auto it = inputTensors_.find(name);
+        if (it != inputTensors_.end()) {
+            transferSequence_->recordCopy(userTensor.buffer(), it->second->buffer());
+        }
+    }
+    transferSequence_->transferBarrier();
+    transferSequence_->end();
+    
+    // Dependency analysis (same as prepare())
+    std::set<std::string> dirtyTensors;
+    std::map<std::string, size_t> lastWriter;
+    std::vector<bool> needsBarrierBefore(preparedOps_.size(), false);
+    
+    for (size_t i = 0; i < preparedOps_.size(); i++) {
+        auto& prepared = preparedOps_[i];
+        bool needsBarrier = false;
+        for (const auto& inputName : prepared.node->inputs) {
+            if (inputName.empty()) continue;
+            auto it = lastWriter.find(inputName);
+            if (it != lastWriter.end() && dirtyTensors.count(inputName) > 0) {
+                needsBarrier = true;
+                break;
+            }
+        }
+        if (needsBarrier) {
+            needsBarrierBefore[i] = true;
+            dirtyTensors.clear();
+        }
+        for (const auto& outputName : prepared.outputNames) {
+            if (!outputName.empty()) {
+                dirtyTensors.insert(outputName);
+                lastWriter[outputName] = i;
+            }
+        }
     }
     
-    // Run full inference and get total time
-    std::map<std::string, Tensor*> outputs;
-    double totalMs = runTimed(inputs, outputs);
+    // Record profiling sequence with timestamps around each operator
+    profileSeq.begin();
+    profileSeq.writeTimestamp(0);  // Start timestamp
     
-    std::cout << "\n=== Operator Counts ===" << std::endl;
-    for (const auto& [opType, count] : opCounts) {
-        std::cout << "  " << opType << ": " << count << std::endl;
+    for (size_t i = 0; i < preparedOps_.size(); i++) {
+        auto& prepared = preparedOps_[i];
+        
+        if (needsBarrierBefore[i]) {
+            profileSeq.barrier();
+        }
+        
+        // Timestamp before operator
+        profileSeq.writeTimestamp(i * 2 + 1);
+        
+        prepared.op->record(profileSeq, prepared.inputs, prepared.outputs, *prepared.node);
+        
+        // Barrier and timestamp after operator to ensure completion
+        profileSeq.barrier();
+        profileSeq.writeTimestamp(i * 2 + 2);
+    }
+    
+    profileSeq.end();
+    
+    // Submit with transfer prefix and wait
+    double totalMs = profileSeq.submitWithPrefixAndWait(transferSequence_->cmdBuffer());
+    
+    // Fetch timestamps
+    auto timestamps = profileSeq.fetchTimestamps();
+    
+    // Convert timestamps to milliseconds
+    float timestampPeriod = ctx_->timestampPeriod;  // nanoseconds per tick
+    
+    // Helper to detect actual operator type (handles fusion)
+    auto getActualOpType = [](const PreparedOp& prepared) -> std::string {
+        std::string opType = prepared.node->opType;
+        // Check if this was a fused ConvSilu
+        if (opType == "Conv" && prepared.op) {
+            // Check if outputs go to a SiLU pattern
+            for (const auto& outName : prepared.outputNames) {
+                // If output name differs from node output, it's likely fused
+                if (!prepared.node->outputs.empty() && outName != prepared.node->outputs[0]) {
+                    return "ConvSilu";
+                }
+            }
+        }
+        return opType;
+    };
+    
+    // Per-operator timings
+    std::vector<std::pair<std::string, double>> opTimings;
+    std::map<std::string, double> typeTimings;  // Aggregate by type
+    std::map<std::string, int> typeCounts;      // Count by actual type
+    
+    if (timestamps.size() >= numTimestamps) {
+        for (size_t i = 0; i < preparedOps_.size(); i++) {
+            uint64_t startTick = timestamps[i * 2 + 1];
+            uint64_t endTick = timestamps[i * 2 + 2];
+            double opTimeNs = (endTick - startTick) * timestampPeriod;
+            double opTimeMs = opTimeNs / 1e6;
+            
+            const auto& prepared = preparedOps_[i];
+            std::string opName = prepared.node->name;
+            std::string opType = getActualOpType(prepared);
+            
+            opTimings.push_back({opName + " (" + opType + ")", opTimeMs});
+            typeTimings[opType] += opTimeMs;
+            typeCounts[opType]++;
+        }
+    }
+    
+    // Print detailed per-operator timings
+    std::cout << "\n=== Per-Operator Timing (GPU timestamps) ===" << std::endl;
+    std::cout << std::fixed << std::setprecision(3);
+    
+    double sumMs = 0.0;
+    for (const auto& [name, timeMs] : opTimings) {
+        std::cout << "  " << std::setw(50) << std::left << name 
+                  << std::setw(10) << std::right << timeMs << " ms" << std::endl;
+        sumMs += timeMs;
+    }
+    
+    std::cout << "\n=== Timing by Operator Type ===" << std::endl;
+    // Sort by time (descending)
+    std::vector<std::pair<std::string, double>> sortedTypes(typeTimings.begin(), typeTimings.end());
+    std::sort(sortedTypes.begin(), sortedTypes.end(), 
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    
+    for (const auto& [opType, timeMs] : sortedTypes) {
+        int count = typeCounts[opType];
+        double pct = (sumMs > 0) ? (timeMs / sumMs * 100.0) : 0.0;
+        std::cout << "  " << std::setw(15) << std::left << opType
+                  << std::setw(5) << std::right << count << "x"
+                  << std::setw(12) << std::right << timeMs << " ms"
+                  << std::setw(8) << std::right << pct << "%" << std::endl;
+        timings[opType + "_ms"] = timeMs;
+    }
+    
+    std::cout << "\n=== Summary ===" << std::endl;
+    std::cout << "  Operators profiled: " << preparedOps_.size() << std::endl;
+    std::cout << "  Sum of operator times: " << sumMs << " ms" << std::endl;
+    std::cout << "  Total GPU time: " << totalMs << " ms" << std::endl;
+    
+    // Store counts in timings
+    for (const auto& [opType, count] : typeCounts) {
         timings[opType + "_count"] = count;
     }
     timings["total_ms"] = totalMs;
+    timings["sum_operators_ms"] = sumMs;
     
     return timings;
 }

@@ -1,5 +1,6 @@
 #include "conv_silu.hpp"
 #include <stdexcept>
+#include <iostream>
 
 namespace onnxrt {
 
@@ -34,13 +35,43 @@ void ConvSiluOp::prepare(vkcompute::Context& ctx, const std::vector<Tensor*>& in
     params_.groups = static_cast<uint32_t>(groups);
     params_.hasBias = (inputs.size() > 2 && inputs[2] != nullptr) ? 1 : 0;
 
-    // Use the fused conv2d_silu shader
-    std::string shaderPath = shaderDir + "/conv2d_silu_shader.spv";
+    // Decide whether to use cooperative matrix path
+    useCoopMat_ = false;
+    if (ctx.coopMatrixSupported && !ctx.coopMatConfigs.empty() && params_.groups == 1) {
+        coopM_ = ctx.coopMatConfigs[0].MSize;
+        coopN_ = ctx.coopMatConfigs[0].NSize;
+        coopK_ = ctx.coopMatConfigs[0].KSize;
 
-    // Number of bindings: input, weight, output, bias (4 total)
+        uint32_t M = params_.N * params_.outH * params_.outW;
+        uint32_t K = params_.C * params_.R * params_.S;
+        uint32_t N = params_.K;
+
+        if (M >= coopM_ && N >= coopN_ && K >= coopK_) {
+            useCoopMat_ = true;
+        }
+    }
+
+    // std::cout << "ConvSilu: cooperative matrix " << (useCoopMat_ ? "ON" : "OFF")
+    //           << " (supported=" << ctx.coopMatrixSupported
+    //           << ", groups=" << params_.groups
+    //           << ", M=" << params_.N * params_.outH * params_.outW
+    //           << ", K=" << params_.C * params_.R * params_.S
+    //           << ", N=" << params_.K << ")" << std::endl;
+
     int numBindings = params_.hasBias ? 4 : 3;
-    pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
-        ctx, shaderPath, numBindings, 256, sizeof(Conv2DParams));
+
+    if (useCoopMat_) {
+        std::string shaderPath = shaderDir + "/conv2d_silu_coopmat_shader.spv";
+        // Workgroup size 128 = 4 subgroups, each handles one 16x16 tile
+        // Together they process a 32x32 output block per workgroup
+        std::vector<uint32_t> specConstants = {128, coopM_, coopN_, coopK_};
+        pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
+            ctx, shaderPath, numBindings, specConstants, sizeof(Conv2DParams));
+    } else {
+        std::string shaderPath = shaderDir + "/conv2d_silu_shader.spv";
+        pipeline_ = std::make_unique<vkcompute::ComputePipeline>(
+            ctx, shaderPath, numBindings, 256, sizeof(Conv2DParams));
+    }
 
     // Bind buffers: input, weight, output, [bias]
     std::vector<vkcompute::Buffer*> buffers;
@@ -57,14 +88,27 @@ void ConvSiluOp::record(vkcompute::Sequence& seq, const std::vector<Tensor*>& in
                         const std::vector<Tensor*>& outputs, const Node& node) {
     pipeline_->setPushConstants(&params_, sizeof(params_));
 
-    // Dispatch with 2D tiling: TILE_OW=4 pixels x TILE_K=4 channels per thread
-    const uint32_t TILE_OW = 4;
-    const uint32_t TILE_K = 4;
-    uint32_t tiledOutW = (params_.outW + TILE_OW - 1) / TILE_OW;
-    uint32_t tiledK = (params_.K + TILE_K - 1) / TILE_K;
-    uint32_t totalTiles = params_.N * tiledK * params_.outH * tiledOutW;
-    uint32_t numGroups = (totalTiles + 255) / 256;
-    pipeline_->recordTo(seq.cmdBuffer(), numGroups);
+    if (useCoopMat_) {
+        // Cooperative matrix dispatch: each workgroup computes one 32x32 block
+        // (2x2 grid of 16x16 cooperative tiles, handled by 4 subgroups)
+        const uint32_t WG_M = 2 * coopM_;  // 32
+        const uint32_t WG_N = 2 * coopN_;  // 32
+        uint32_t M = params_.N * params_.outH * params_.outW;
+        uint32_t N = params_.K;
+        uint32_t tilesM = (M + WG_M - 1) / WG_M;
+        uint32_t tilesN = (N + WG_N - 1) / WG_N;
+        uint32_t totalWorkgroups = tilesM * tilesN;
+        pipeline_->recordTo(seq.cmdBuffer(), totalWorkgroups);
+    } else {
+        // Original scalar dispatch: TILE_OW=4 pixels x TILE_K=4 channels per thread
+        const uint32_t TILE_OW = 4;
+        const uint32_t TILE_K = 4;
+        uint32_t tiledOutW = (params_.outW + TILE_OW - 1) / TILE_OW;
+        uint32_t tiledK = (params_.K + TILE_K - 1) / TILE_K;
+        uint32_t totalTiles = params_.N * tiledK * params_.outH * tiledOutW;
+        uint32_t numGroups = (totalTiles + 255) / 256;
+        pipeline_->recordTo(seq.cmdBuffer(), numGroups);
+    }
 }
 
 REGISTER_OPERATOR("ConvSilu", ConvSiluOp);

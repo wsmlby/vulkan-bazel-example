@@ -9,6 +9,11 @@ glsl_shader(name = "pow_shader", src = "shaders/pow.comp")
 glsl_shader(name = "sigmoid_shader", src = "shaders/sigmoid.comp")
 glsl_shader(name = "conv2d_shader", src = "shaders/conv2d.comp")
 glsl_shader(name = "conv2d_silu_shader", src = "shaders/conv2d_silu.comp")
+glsl_shader(
+    name = "conv2d_silu_coopmat_shader",
+    src = "shaders/conv2d_silu_coopmat.comp",
+    extra_args = ["--target-env=vulkan1.1", "--target-spv=spv1.6"],
+)
 glsl_shader(name = "maxpool_shader", src = "shaders/maxpool.comp")
 glsl_shader(name = "resize_shader", src = "shaders/resize.comp")
 glsl_shader(name = "concat_shader", src = "shaders/concat.comp")
@@ -24,6 +29,7 @@ filegroup(
         ":sigmoid_shader",
         ":conv2d_shader",
         ":conv2d_silu_shader",
+        ":conv2d_silu_coopmat_shader",
         ":maxpool_shader",
         ":resize_shader",
         ":concat_shader",

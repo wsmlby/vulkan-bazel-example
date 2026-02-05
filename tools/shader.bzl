@@ -4,15 +4,15 @@ def _glsl_shader_impl(ctx):
     output = ctx.actions.declare_file(ctx.attr.name + ".spv")
     glslc = ctx.file._glslc
 
+    args = ["-fshader-stage=compute"]
+    args.extend(ctx.attr.extra_args)
+    args.extend([ctx.file.src.path, "-o", output.path])
+
     ctx.actions.run(
         inputs = [ctx.file.src, glslc],
         outputs = [output],
         executable = glslc,
-        arguments = [
-            "-fshader-stage=compute",
-            ctx.file.src.path,
-            "-o", output.path,
-        ],
+        arguments = args,
         mnemonic = "GLSLC",
         progress_message = "Compiling shader %s" % ctx.file.src.short_path,
     )
@@ -26,6 +26,7 @@ glsl_shader = rule(
             allow_single_file = [".comp", ".glsl"],
             mandatory = True,
         ),
+        "extra_args": attr.string_list(default = []),
         "_glslc": attr.label(
             default = "@shaderc//:build_glslc",
             allow_single_file = True,

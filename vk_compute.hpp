@@ -39,6 +39,16 @@ public:
     bool timestampsSupported = false;
     float timestampPeriod = 1.0f; // nanoseconds per tick
 
+    // Cooperative matrix support (VK_KHR_cooperative_matrix)
+    bool coopMatrixSupported = false;
+    struct CoopMatConfig {
+        uint32_t MSize;
+        uint32_t NSize;
+        uint32_t KSize;
+        bool mixedPrecision; // true = fp16 A/B with fp32 C/Result
+    };
+    std::vector<CoopMatConfig> coopMatConfigs;
+
     // Create a Vulkan context, optionally filtering devices by name (e.g., "NVIDIA", "AMD", "Intel")
     Context(const std::string& preferredDevice = "");
     ~Context();
@@ -118,6 +128,11 @@ public:
     // pushConstantSize: size of push constants in bytes (0 to disable)
     ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount,
                     uint32_t workgroupSize = 256, uint32_t pushConstantSize = 0);
+
+    // Create a compute pipeline with multiple specialization constants
+    // specConstants[i] maps to constant_id=i (e.g., [workgroupSize, coopM, coopN, coopK])
+    ComputePipeline(Context& context, const std::string& spvPath, uint32_t bufferCount,
+                    const std::vector<uint32_t>& specConstants, uint32_t pushConstantSize);
     ~ComputePipeline();
 
     ComputePipeline(ComputePipeline&& o) noexcept;

@@ -27,6 +27,10 @@ public:
         const std::vector<Tensor*>& inputs,
         const std::vector<Tensor*>& outputs,
         const Node& node) override;
+
+private:
+    bool useCoopMat_ = false;
+    uint32_t coopM_ = 16, coopN_ = 16, coopK_ = 16;
 };
 
 } // namespace onnxrt
