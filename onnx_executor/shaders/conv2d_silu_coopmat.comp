@@ -5,12 +5,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Fused Conv2D + SiLU using cooperative matrix (tensor core) acceleration
-// Mixed precision: fp16 A/B inputs, fp32 accumulator
-// Convolution is reformulated as implicit GEMM:
-//   Output[M, N] = im2col(Input)[M, K] * Weight[K, N]
-// where M = batch*outH*outW, K = C*R*S, N = output_channels
-//
-// Optimized version: 4 subgroups, 2x2 tile grid = 32x32 outputs per workgroup
+// 32x32 Tile with FP16 Accumulation
+// - WG_M=32, WG_N=32
+// - 4 Subgroups (128 threads) organized in 2x2 Grid
+// - Acc: FP16
 
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 128;
 layout(constant_id = 1) const uint COOP_M = 16;
@@ -18,12 +16,19 @@ layout(constant_id = 2) const uint COOP_N = 16;
 layout(constant_id = 3) const uint COOP_K = 16;
 
 const uint SUBGROUP_SIZE = 32;
-const uint NUM_SUBGROUPS = WORKGROUP_SIZE / SUBGROUP_SIZE;  // 4
 
-const uint TILES_M = 2;
-const uint TILES_N = 2;
-const uint WG_M = TILES_M * COOP_M;  // 32
-const uint WG_N = TILES_N * COOP_N;  // 32
+// Configuration for 32x32 Tile
+const uint SG_GRID_M = 2; 
+const uint SG_GRID_N = 2; 
+
+const uint ACC_TILES_M = 1; 
+const uint ACC_TILES_N = 1; 
+
+const uint WG_M = SG_GRID_M * ACC_TILES_M * COOP_M;  // 32
+const uint WG_N = SG_GRID_N * ACC_TILES_N * COOP_N;  // 32
+
+// Padding to avoid bank conflicts. 
+const uint B_STRIDE = WG_N + 8; // 40
 
 layout(local_size_x_id = 0) in;
 
@@ -32,7 +37,7 @@ layout(push_constant) uniform PushConstants {
     uint C;         // Input channels
     uint H;         // Input height
     uint W;         // Input width
-    uint K;         // Output channels
+    uint K;         // Output channels (N_out)
     uint R;         // Kernel height
     uint S;         // Kernel width
     uint outH;      // Output height
@@ -52,9 +57,14 @@ layout(binding = 1) readonly buffer Weight { float weight_data[]; };
 layout(binding = 2) buffer Output { float output_data[]; };
 layout(binding = 3) readonly buffer Bias { float bias_data[]; };
 
-shared float16_t smem_A[WG_M * COOP_K];
-shared float16_t smem_B[COOP_K * WG_N];
-shared float smem_C[TILES_M * TILES_N * COOP_M * COOP_N];
+// Shared Memory
+shared float16_t smem_A[WG_M * COOP_K]; // 32x16 = 512
+shared float16_t smem_B[COOP_K * B_STRIDE]; // 16x40 = 640
+shared float16_t smem_C[WG_M * WG_N]; // 32x32 = 1024 (FP16)
+
+shared uint smem_n[WG_M];
+shared uint smem_oh[WG_M];
+shared uint smem_ow[WG_M];
 
 float silu(float x) {
     return x / (1.0 + exp(-x));
@@ -66,6 +76,7 @@ void main() {
     uint K_total = channelsPerGroup * params.R * params.S;
     uint N_out = params.K;
 
+    // Workgroup Position
     uint wgTilesN = (N_out + WG_N - 1) / WG_N;
     uint wgIdx = gl_WorkGroupID.x;
     uint wgTileN = wgIdx % wgTilesN;
@@ -77,38 +88,58 @@ void main() {
     uint filtersPerGroup = params.K / params.groups;
     uint group = nBaseWG / filtersPerGroup;
 
-    uint subgroupId = gl_LocalInvocationID.x / SUBGROUP_SIZE;
-    uint subgroupTileM = subgroupId / TILES_N;
-    uint subgroupTileN = subgroupId % TILES_N;
-
-    coopmat<float, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator> acc =
-        coopmat<float, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator>(0.0);
-
     uint tid = gl_LocalInvocationID.x;
-    uint K_steps = (K_total + COOP_K - 1) / COOP_K;
 
-    // Precomputed strides
+    // Precompute M coordinates
+    if (tid < WG_M) {
+        uint mLocal = tid;
+        uint mGlobal = mBaseWG + mLocal;
+        if (mGlobal < M_total) {
+            uint ow = mGlobal % params.outW;
+            uint tmp = mGlobal / params.outW;
+            uint oh = tmp % params.outH;
+            uint n_batch = tmp / params.outH;
+            
+            smem_n[mLocal] = n_batch;
+            smem_oh[mLocal] = oh;
+            smem_ow[mLocal] = ow;
+        }
+    }
+    barrier();
+
+    uint subgroupId = tid / SUBGROUP_SIZE;
+    uint sgRow = subgroupId / SG_GRID_N; 
+    uint sgCol = subgroupId % SG_GRID_N; 
+
+    // Accumulators - FP16
+    coopmat<float16_t, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator> acc = coopmat<float16_t, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+    uint K_steps = (K_total + COOP_K - 1) / COOP_K;
     uint inputStride_N = params.C * params.H * params.W;
     uint inputStride_C = params.H * params.W;
-    uint weightStride_K = channelsPerGroup * params.R * params.S;
+    uint weightStride_K = K_total;
 
-    for (uint kStep = 0; kStep < K_steps; kStep++) {
-        uint kBase = kStep * COOP_K;
+    float prefetch_A[4];
+    float prefetch_B[4];
 
-        // Load A tile [WG_M x COOP_K]
-        for (uint i = tid; i < WG_M * COOP_K; i += WORKGROUP_SIZE) {
-            uint mLocal = i / COOP_K;
-            uint kLocal = i % COOP_K;
+    // Prologue Load
+    {
+        uint kStep = 0;
+        uint kBase = 0;
+
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = tid + i * WORKGROUP_SIZE;
+            uint mLocal = idx % WG_M;
+            uint kLocal = idx / WG_M;
             uint mGlobal = mBaseWG + mLocal;
             uint kGlobal = kBase + kLocal;
 
             float val = 0.0;
             if (mGlobal < M_total && kGlobal < K_total) {
-                uint ow = mGlobal % params.outW;
-                uint tmp = mGlobal / params.outW;
-                uint oh = tmp % params.outH;
-                uint n = tmp / params.outH;
-
+                uint n_batch = smem_n[mLocal];
+                uint oh = smem_oh[mLocal];
+                uint ow = smem_ow[mLocal];
+                
                 uint s = kGlobal % params.S;
                 uint tmp2 = kGlobal / params.S;
                 uint r = tmp2 % params.R;
@@ -119,82 +150,147 @@ void main() {
                 int iw = int(ow * params.strideW) - int(params.padW) + int(s * params.dilationW);
 
                 if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W)) {
-                    val = input_data[n * inputStride_N + c * inputStride_C + uint(ih) * params.W + uint(iw)];
+                    val = input_data[n_batch * inputStride_N + c * inputStride_C + uint(ih) * params.W + uint(iw)];
                 }
             }
-            smem_A[mLocal * COOP_K + kLocal] = float16_t(val);
+            prefetch_A[i] = val;
         }
 
-        // Load B tile [COOP_K x WG_N]
-        for (uint i = tid; i < COOP_K * WG_N; i += WORKGROUP_SIZE) {
-            uint kLocal = i / WG_N;
-            uint nLocal = i % WG_N;
-            uint kGlobal = kBase + kLocal;
-            uint nGlobal = nBaseWG + nLocal;
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = tid + i * WORKGROUP_SIZE;
+            uint row = idx / COOP_K; 
+            uint col = idx % COOP_K; 
+            uint nGlobal = nBaseWG + row;
+            uint kGlobal = kBase + col;
 
             float val = 0.0;
-            if (kGlobal < K_total && nGlobal < N_out) {
-                uint s = kGlobal % params.S;
-                uint tmp = kGlobal / params.S;
-                uint r = tmp % params.R;
-                uint c_local = tmp / params.R;
-
-                val = weight_data[nGlobal * weightStride_K + c_local * params.R * params.S + r * params.S + s];
+            if (nGlobal < N_out && kGlobal < K_total) {
+                val = weight_data[nGlobal * weightStride_K + kGlobal];
             }
-            smem_B[kLocal * WG_N + nLocal] = float16_t(val);
+            prefetch_B[i] = val;
         }
+    }
 
+    for (uint kStep = 0; kStep < K_steps; kStep++) {
+        // Write PREFETCH to SMEM
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = tid + i * WORKGROUP_SIZE;
+            
+            // A
+            uint mLocal = idx % WG_M;
+            uint kLocal = idx / WG_M;
+            smem_A[mLocal * COOP_K + kLocal] = float16_t(prefetch_A[i]);
+            
+            // B
+            uint row = idx / COOP_K; 
+            uint col = idx % COOP_K; 
+            smem_B[col * B_STRIDE + row] = float16_t(prefetch_B[i]);
+        }
+        
         barrier();
 
+        // Compute
         coopmat<float16_t, gl_ScopeSubgroup, COOP_M, COOP_K, gl_MatrixUseA> matA;
         coopmat<float16_t, gl_ScopeSubgroup, COOP_K, COOP_N, gl_MatrixUseB> matB;
 
-        uint aOffset = subgroupTileM * COOP_M * COOP_K;
-        coopMatLoad(matA, smem_A, aOffset, COOP_K, gl_CooperativeMatrixLayoutRowMajor);
+        // Tile A: tileM = sgRow (0 or 1). Offset = tileM * 16.
+        uint offsetA = sgRow * COOP_M * COOP_K;
+        coopMatLoad(matA, smem_A, offsetA, COOP_K, gl_CooperativeMatrixLayoutRowMajor);
 
-        uint bOffset = subgroupTileN * COOP_N;
-        coopMatLoad(matB, smem_B, bOffset, WG_N, gl_CooperativeMatrixLayoutRowMajor);
+        // Tile B: tileN = sgCol (0 or 1). Offset = tileN * 16.
+        uint offsetB = sgCol * COOP_N;
+        coopMatLoad(matB, smem_B, offsetB, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
 
         acc = coopMatMulAdd(matA, matB, acc);
 
+        // Prefetch NEXT
+        if (kStep < K_steps - 1) {
+            uint nextK = (kStep + 1) * COOP_K;
+
+            // Load A
+            for (uint i = 0; i < 4; ++i) {
+                uint idx = tid + i * WORKGROUP_SIZE;
+                uint mLocal = idx % WG_M; 
+                uint kLocal = idx / WG_M; 
+                uint mGlobal = mBaseWG + mLocal;
+                uint kGlobal = nextK + kLocal;
+
+                float val = 0.0;
+                if (mGlobal < M_total && kGlobal < K_total) {
+                    uint n_batch = smem_n[mLocal];
+                    uint oh = smem_oh[mLocal];
+                    uint ow = smem_ow[mLocal];
+                    
+                    uint s = kGlobal % params.S;
+                    uint r = (kGlobal / params.S) % params.R;
+                    uint c_local = (kGlobal / params.S) / params.R;
+                    uint c = group * channelsPerGroup + c_local;
+
+                    int ih = int(oh * params.strideH) - int(params.padH) + int(r * params.dilationH);
+                    int iw = int(ow * params.strideW) - int(params.padW) + int(s * params.dilationW);
+
+                    if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W)) {
+                        val = input_data[n_batch * inputStride_N + c * inputStride_C + uint(ih) * params.W + uint(iw)];
+                    }
+                }
+                prefetch_A[i] = val;
+            }
+
+            // Load B
+            for (uint i = 0; i < 4; ++i) {
+                uint idx = tid + i * WORKGROUP_SIZE;
+                uint row = idx / COOP_K; 
+                uint col = idx % COOP_K; 
+                uint nGlobal = nBaseWG + row;
+                uint kGlobal = nextK + col;
+
+                float val = 0.0;
+                if (nGlobal < N_out && kGlobal < K_total) {
+                    val = weight_data[nGlobal * weightStride_K + kGlobal];
+                }
+                prefetch_B[i] = val;
+            }
+        }
+        
         barrier();
     }
 
-    // Store to shared memory
-    uint cOffset = subgroupId * COOP_M * COOP_N;
-    coopMatStore(acc, smem_C, cOffset, COOP_N, gl_CooperativeMatrixLayoutRowMajor);
+    // Store C
+    uint startM = sgRow * COOP_M;
+    uint startN = sgCol * COOP_N;
+    uint offsetC = startM * WG_N + startN;
+    coopMatStore(acc, smem_C, offsetC, WG_N, gl_CooperativeMatrixLayoutRowMajor);
+    
     barrier();
 
-    // Apply bias + SiLU and write output
-    uint outputStride_K = params.outH * params.outW;
-    uint outputStride_N = params.K * outputStride_K;
+    // Store Output
+    // 32x32 = 1024 elements. 128 threads -> 8 elements.
+    for (uint i = 0; i < 8; ++i) {
+        uint idx = tid + i * WORKGROUP_SIZE;
+        uint mLocal = idx / WG_N; // 0..31
+        uint nLocal = idx % WG_N; // 0..31
+        
+        if (mLocal < WG_M) {
+            uint mGlobal = mBaseWG + mLocal;
+            uint nGlobal = nBaseWG + nLocal;
 
-    for (uint i = tid; i < TILES_M * TILES_N * COOP_M * COOP_N; i += WORKGROUP_SIZE) {
-        uint subgroup = i / (COOP_M * COOP_N);
-        uint localIdx = i % (COOP_M * COOP_N);
-        uint mLocalTile = localIdx / COOP_N;
-        uint nLocalTile = localIdx % COOP_N;
+            if (mGlobal < M_total && nGlobal < N_out) {
+                // Read float16 from smem, convert to float for Silu
+                float val = float(smem_C[idx]);
+                if (params.hasBias != 0u) val += bias_data[nGlobal];
+                val = silu(val);
 
-        uint subgroupTileM_ = subgroup / TILES_N;
-        uint subgroupTileN_ = subgroup % TILES_N;
+                uint ow = mGlobal % params.outW;
+                uint tmp = mGlobal / params.outW;
+                uint oh = tmp % params.outH;
+                uint n_batch = tmp / params.outH;
 
-        uint mGlobal = mBaseWG + subgroupTileM_ * COOP_M + mLocalTile;
-        uint nGlobal = nBaseWG + subgroupTileN_ * COOP_N + nLocalTile;
-
-        if (mGlobal < M_total && nGlobal < N_out) {
-            float val = smem_C[i];
-
-            if (params.hasBias != 0u) {
-                val += bias_data[nGlobal];
+                uint outIdx = n_batch * (N_out * params.outH * params.outW) 
+                            + nGlobal * (params.outH * params.outW)
+                            + oh * params.outW + ow;
+                
+                output_data[outIdx] = val;
             }
-            val = silu(val);
-
-            uint ow = mGlobal % params.outW;
-            uint tmp = mGlobal / params.outW;
-            uint oh = tmp % params.outH;
-            uint n = tmp / params.outH;
-
-            output_data[n * outputStride_N + nGlobal * outputStride_K + oh * params.outW + ow] = val;
         }
     }
 }
