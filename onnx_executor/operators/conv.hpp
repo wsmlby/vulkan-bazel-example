@@ -50,7 +50,7 @@ public:
         const std::vector<Tensor*>& outputs,
         const Node& node) override;
 
-private:
+protected:
     std::unique_ptr<vkcompute::ComputePipeline> pipeline_;
     Conv2DParams params_;
 };

@@ -1,0 +1,164 @@
+#version 450
+
+// Fused Conv + SiLU shader
+// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// This eliminates 2 memory round-trips vs separate Conv+Sigmoid+Mul
+
+layout(local_size_x = 256) in;
+
+const uint TILE_OW = 4;   // 4 output pixels per thread along width
+const uint TILE_K = 2;    // 2 output channels per thread
+
+layout(push_constant) uniform PushConstants {
+    uint N;         // Batch size
+    uint C;         // Input channels
+    uint H;         // Input height
+    uint W;         // Input width
+    uint K;         // Output channels
+    uint R;         // Kernel height
+    uint S;         // Kernel width
+    uint outH;      // Output height
+    uint outW;      // Output width
+    uint padH;      // Padding height
+    uint padW;      // Padding width
+    uint strideH;   // Stride height
+    uint strideW;   // Stride width
+    uint dilationH; // Dilation height
+    uint dilationW; // Dilation width
+    uint groups;    // Number of groups
+    uint hasBias;   // 1 if bias present, 0 otherwise
+} params;
+
+layout(binding = 0) readonly buffer Input { float input_data[]; };
+layout(binding = 1) readonly buffer Weight { float weight_data[]; };
+layout(binding = 2) buffer Output { float output_data[]; };
+layout(binding = 3) readonly buffer Bias { float bias_data[]; };
+
+// SiLU activation: x * sigmoid(x)
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    // Each thread handles TILE_OW pixels x TILE_K channels
+    uint tiledOutW = (params.outW + TILE_OW - 1) / TILE_OW;
+    uint tiledK = (params.K + TILE_K - 1) / TILE_K;
+    uint totalTiles = params.N * tiledK * params.outH * tiledOutW;
+    if (idx >= totalTiles) return;
+
+    // Decode tile index: [n, tileK, oh, tileOw]
+    uint tileOw = idx % tiledOutW;
+    uint temp = idx / tiledOutW;
+    uint oh = temp % params.outH;
+    temp = temp / params.outH;
+    uint tileK = temp % tiledK;
+    uint n = temp / tiledK;
+    
+    uint owBase = tileOw * TILE_OW;
+    uint kBase = tileK * TILE_K;
+
+    // Accumulators for TILE_OW x TILE_K outputs
+    float sum00 = 0.0, sum01 = 0.0, sum02 = 0.0, sum03 = 0.0;  // channel kBase+0
+    float sum10 = 0.0, sum11 = 0.0, sum12 = 0.0, sum13 = 0.0;  // channel kBase+1
+
+    uint channelsPerGroup = params.C / params.groups;
+    uint filtersPerGroup = params.K / params.groups;
+    
+    // For group convolution, both output channels should be in same group
+    uint group0 = kBase / filtersPerGroup;
+
+    // Pre-compute base indices
+    uint inputBaseN = n * params.C * params.H * params.W;
+    
+    int ihBase = int(oh * params.strideH) - int(params.padH);
+    int iwBase0 = int(owBase * params.strideW) - int(params.padW);
+    int iwBase1 = iwBase0 + int(params.strideW);
+    int iwBase2 = iwBase1 + int(params.strideW);
+    int iwBase3 = iwBase2 + int(params.strideW);
+    
+    // Output validity
+    bool validOw0 = (owBase + 0) < params.outW;
+    bool validOw1 = (owBase + 1) < params.outW;
+    bool validOw2 = (owBase + 2) < params.outW;
+    bool validOw3 = (owBase + 3) < params.outW;
+    bool validK0 = kBase < params.K;
+    bool validK1 = (kBase + 1) < params.K;
+
+    uint weightBaseK0 = kBase * channelsPerGroup * params.R * params.S;
+    uint weightBaseK1 = (kBase + 1) * channelsPerGroup * params.R * params.S;
+
+    for (uint c = 0; c < channelsPerGroup; c++) {
+        uint actualC = group0 * channelsPerGroup + c;
+        uint inputBaseC = inputBaseN + actualC * params.H * params.W;
+        uint weightOff = c * params.R * params.S;
+
+        for (uint r = 0; r < params.R; r++) {
+            int ih = ihBase + int(r * params.dilationH);
+            
+            if (ih >= 0 && ih < int(params.H)) {
+                uint inputBaseH = inputBaseC + uint(ih) * params.W;
+                uint weightOffR = weightOff + r * params.S;
+
+                for (uint s = 0; s < params.S; s++) {
+                    // Read weights for both output channels
+                    float w0 = validK0 ? weight_data[weightBaseK0 + weightOffR + s] : 0.0;
+                    float w1 = validK1 ? weight_data[weightBaseK1 + weightOffR + s] : 0.0;
+                    
+                    int dw = int(s * params.dilationW);
+                    
+                    // Read input once, reuse for both channels
+                    int iw0 = iwBase0 + dw;
+                    int iw1 = iwBase1 + dw;
+                    int iw2 = iwBase2 + dw;
+                    int iw3 = iwBase3 + dw;
+                    
+                    float in0 = (validOw0 && iw0 >= 0 && iw0 < int(params.W)) ? input_data[inputBaseH + uint(iw0)] : 0.0;
+                    float in1 = (validOw1 && iw1 >= 0 && iw1 < int(params.W)) ? input_data[inputBaseH + uint(iw1)] : 0.0;
+                    float in2 = (validOw2 && iw2 >= 0 && iw2 < int(params.W)) ? input_data[inputBaseH + uint(iw2)] : 0.0;
+                    float in3 = (validOw3 && iw3 >= 0 && iw3 < int(params.W)) ? input_data[inputBaseH + uint(iw3)] : 0.0;
+                    
+                    // Accumulate for channel 0
+                    sum00 += in0 * w0;
+                    sum01 += in1 * w0;
+                    sum02 += in2 * w0;
+                    sum03 += in3 * w0;
+                    
+                    // Accumulate for channel 1
+                    sum10 += in0 * w1;
+                    sum11 += in1 * w1;
+                    sum12 += in2 * w1;
+                    sum13 += in3 * w1;
+                }
+            }
+        }
+    }
+
+    // Add bias
+    float bias0 = (params.hasBias != 0u && validK0) ? bias_data[kBase] : 0.0;
+    float bias1 = (params.hasBias != 0u && validK1) ? bias_data[kBase + 1] : 0.0;
+    
+    sum00 += bias0; sum01 += bias0; sum02 += bias0; sum03 += bias0;
+    sum10 += bias1; sum11 += bias1; sum12 += bias1; sum13 += bias1;
+    
+    // Apply SiLU activation: x * sigmoid(x)
+    sum00 = silu(sum00); sum01 = silu(sum01); sum02 = silu(sum02); sum03 = silu(sum03);
+    sum10 = silu(sum10); sum11 = silu(sum11); sum12 = silu(sum12); sum13 = silu(sum13);
+    
+    // Write outputs
+    uint outBaseIdx0 = n * params.K * params.outH * params.outW + 
+                       kBase * params.outH * params.outW + 
+                       oh * params.outW + owBase;
+    uint outBaseIdx1 = outBaseIdx0 + params.outH * params.outW;
+    
+    if (validK0 && validOw0) output_data[outBaseIdx0 + 0] = sum00;
+    if (validK0 && validOw1) output_data[outBaseIdx0 + 1] = sum01;
+    if (validK0 && validOw2) output_data[outBaseIdx0 + 2] = sum02;
+    if (validK0 && validOw3) output_data[outBaseIdx0 + 3] = sum03;
+    
+    if (validK1 && validOw0) output_data[outBaseIdx1 + 0] = sum10;
+    if (validK1 && validOw1) output_data[outBaseIdx1 + 1] = sum11;
+    if (validK1 && validOw2) output_data[outBaseIdx1 + 2] = sum12;
+    if (validK1 && validOw3) output_data[outBaseIdx1 + 3] = sum13;
+}

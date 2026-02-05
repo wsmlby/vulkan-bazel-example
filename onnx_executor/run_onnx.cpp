@@ -289,6 +289,7 @@ int main(int argc, char** argv) {
         int inputHeight = 1280;
         float confThreshold = 0.25f;
         float iouThreshold = 0.45f;
+        bool profileMode = false;
 
         for (int i = 1; i < argc; i++) {
             if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -304,6 +305,8 @@ int main(int argc, char** argv) {
                 confThreshold = std::atof(argv[++i]);
             } else if (std::strcmp(argv[i], "--iou") == 0 && i + 1 < argc) {
                 iouThreshold = std::atof(argv[++i]);
+            } else if (std::strcmp(argv[i], "--profile") == 0) {
+                profileMode = true;
             } else if (std::strcmp(argv[i], "--help") == 0) {
                 std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
                 std::cout << "  --model <path>         ONNX model file (default: model.onnx)" << std::endl;
@@ -312,6 +315,7 @@ int main(int argc, char** argv) {
                 std::cout << "  --input-size <W> <H>   Input image dimensions" << std::endl;
                 std::cout << "  --conf <threshold>     Confidence threshold (default: 0.25)" << std::endl;
                 std::cout << "  --iou <threshold>      NMS IoU threshold (default: 0.45)" << std::endl;
+                std::cout << "  --profile              Show operator profiling info" << std::endl;
                 return 0;
             }
         }
@@ -384,6 +388,15 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "\nUsing gray test image" << std::endl;
             }
+        }
+
+        // Run profiling if requested
+        if (profileMode) {
+            std::cout << "\n========================================" << std::endl;
+            std::cout << "Running profiling..." << std::endl;
+            std::cout << "========================================" << std::endl;
+            auto profile = executor.runProfile(inputs);
+            std::cout << "\nTotal inference time: " << profile["total_ms"] << " ms" << std::endl;
         }
 
         // Run inference

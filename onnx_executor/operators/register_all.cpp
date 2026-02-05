@@ -2,6 +2,7 @@
 #include "operator_registry.hpp"
 #include "elementwise.hpp"
 #include "conv.hpp"
+#include "conv_silu.hpp"
 #include "pool.hpp"
 #include "resize.hpp"
 #include "concat.hpp"
@@ -26,6 +27,7 @@ void registerAllOperators() {
 
     // Convolution
     reg.registerOp("Conv", []() { return std::make_unique<ConvOp>(); });
+    reg.registerOp("ConvSilu", []() { return std::make_unique<ConvSiluOp>(); });
 
     // Pooling
     reg.registerOp("MaxPool", []() { return std::make_unique<MaxPoolOp>(); });

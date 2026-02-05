@@ -8,6 +8,7 @@ glsl_shader(name = "mul_shader", src = "shaders/mul.comp")
 glsl_shader(name = "pow_shader", src = "shaders/pow.comp")
 glsl_shader(name = "sigmoid_shader", src = "shaders/sigmoid.comp")
 glsl_shader(name = "conv2d_shader", src = "shaders/conv2d.comp")
+glsl_shader(name = "conv2d_silu_shader", src = "shaders/conv2d_silu.comp")
 glsl_shader(name = "maxpool_shader", src = "shaders/maxpool.comp")
 glsl_shader(name = "resize_shader", src = "shaders/resize.comp")
 glsl_shader(name = "concat_shader", src = "shaders/concat.comp")
@@ -22,6 +23,7 @@ filegroup(
         ":pow_shader",
         ":sigmoid_shader",
         ":conv2d_shader",
+        ":conv2d_silu_shader",
         ":maxpool_shader",
         ":resize_shader",
         ":concat_shader",
@@ -41,6 +43,7 @@ cc_library(
         "operators/register_all.cpp",
         "operators/elementwise.cpp",
         "operators/conv.cpp",
+        "operators/conv_silu.cpp",
         "operators/pool.cpp",
         "operators/resize.cpp",
         "operators/concat.cpp",
@@ -57,6 +60,7 @@ cc_library(
         "operators/register_all.hpp",
         "operators/elementwise.hpp",
         "operators/conv.hpp",
+        "operators/conv_silu.hpp",
         "operators/pool.hpp",
         "operators/resize.hpp",
         "operators/concat.hpp",

@@ -89,6 +89,63 @@ void Executor::prepare() {
 
     auto& registry = OperatorRegistry::instance();
 
+    // ============================================================
+    // SiLU Fusion Detection: Conv -> Sigmoid -> Mul
+    // ============================================================
+    std::set<std::string> fusedNodes;  // Nodes to skip (Sigmoid, Mul that are fused)
+    std::set<std::string> siluConvOutputs;  // Conv outputs that should use SiLU activation
+    
+    // Build maps for pattern detection
+    std::map<std::string, const Node*> nodeByOutput;  // tensor_name -> node that produces it
+    std::map<std::string, const Node*> nodeByName;    // node_name -> node
+    
+    for (const auto& node : model_->nodes()) {
+        nodeByName[node.name] = &node;
+        for (const auto& out : node.outputs) {
+            if (!out.empty()) {
+                nodeByOutput[out] = &node;
+            }
+        }
+    }
+    
+    // Find SiLU patterns: Conv -> Sigmoid -> Mul (where Mul takes Conv and Sigmoid outputs)
+    for (const auto& node : model_->nodes()) {
+        if (node.opType == "Mul") {
+            // Check if this Mul is part of SiLU pattern
+            const Node* sigmoidNode = nullptr;
+            const Node* convNode = nullptr;
+            std::string convOutput;
+            std::string sigOutput;
+            
+            for (const auto& input : node.inputs) {
+                auto it = nodeByOutput.find(input);
+                if (it != nodeByOutput.end()) {
+                    if (it->second->opType == "Sigmoid") {
+                        sigmoidNode = it->second;
+                        sigOutput = input;
+                    } else if (it->second->opType == "Conv") {
+                        convNode = it->second;
+                        convOutput = input;
+                    }
+                }
+            }
+            
+            // Check if Sigmoid's input is the Conv output
+            if (sigmoidNode && convNode && !sigmoidNode->inputs.empty()) {
+                if (sigmoidNode->inputs[0] == convOutput) {
+                    // Found SiLU pattern!
+                    fusedNodes.insert(sigmoidNode->name);
+                    fusedNodes.insert(node.name);
+                    siluConvOutputs.insert(convOutput);
+                }
+            }
+        }
+    }
+    
+    if (!siluConvOutputs.empty()) {
+        std::cout << "SiLU fusion: found " << siluConvOutputs.size() << " Conv+SiLU patterns" << std::endl;
+    }
+
     // Track which values have been produced
     std::set<std::string> producedValues;
 
@@ -185,16 +242,61 @@ void Executor::prepare() {
 
     // Create tensors for intermediate values
     for (const auto& node : model_->nodes()) {
+        // Skip fused nodes (Sigmoid and Mul that are part of SiLU)
+        if (fusedNodes.count(node.name) > 0) {
+            // Mark outputs as produced (they'll be written by the fused Conv)
+            for (const auto& outputName : node.outputs) {
+                if (!outputName.empty()) {
+                    producedValues.insert(outputName);
+                }
+            }
+            continue;
+        }
+        
+        // Check if this Conv uses SiLU fusion
+        bool useSiluFusion = false;
+        std::string siluOutputName;
+        if (node.opType == "Conv" && !node.outputs.empty()) {
+            if (siluConvOutputs.count(node.outputs[0]) > 0) {
+                useSiluFusion = true;
+                // Find the Mul node's output (which becomes our final output)
+                for (const auto& mulNode : model_->nodes()) {
+                    if (fusedNodes.count(mulNode.name) > 0 && mulNode.opType == "Mul") {
+                        // Check if this Mul uses our Conv's Sigmoid output
+                        for (const auto& input : mulNode.inputs) {
+                            auto it = nodeByOutput.find(input);
+                            if (it != nodeByOutput.end() && it->second->opType == "Sigmoid") {
+                                if (!it->second->inputs.empty() && it->second->inputs[0] == node.outputs[0]) {
+                                    siluOutputName = mulNode.outputs[0];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!siluOutputName.empty()) break;
+                }
+                if (useSiluFusion) {
+                    // Debug: print fusion info but commented out
+                    // std::cout << "  Fusing Conv " << node.name << " -> " << siluOutputName << std::endl;
+                }
+            }
+        }
+        
         // Check if operator is supported
-        if (!registry.hasOp(node.opType)) {
-            std::cout << "Warning: Unsupported operator: " << node.opType << std::endl;
+        std::string opType = node.opType;
+        if (useSiluFusion && opType == "Conv") {
+            opType = "ConvSilu";  // Use fused operator
+        }
+        
+        if (!registry.hasOp(opType)) {
+            std::cout << "Warning: Unsupported operator: " << opType << std::endl;
             continue;
         }
 
         // Create operator instance
-        auto op = registry.createOp(node.opType);
+        auto op = registry.createOp(opType);
         if (!op) {
-            std::cout << "Warning: Failed to create operator: " << node.opType << std::endl;
+            std::cout << "Warning: Failed to create operator: " << opType << std::endl;
             continue;
         }
 
@@ -289,9 +391,17 @@ void Executor::prepare() {
 
         // Create output tensors
         std::vector<Tensor*> outputTensors;
+        std::vector<std::string> actualOutputNames;  // Track actual names (may differ for fused ops)
         for (size_t i = 0; i < node.outputs.size() && i < outputShapes.size(); i++) {
-            const auto& outputName = node.outputs[i];
+            std::string outputName = node.outputs[i];
             if (outputName.empty()) continue;
+
+            // For SiLU fusion, the Conv's output becomes the Mul's output
+            if (useSiluFusion && i == 0 && !siluOutputName.empty()) {
+                // Debug: commented out
+                // std::cout << "    Remapping output: " << outputName << " -> " << siluOutputName << std::endl;
+                outputName = siluOutputName;
+            }
 
             Shape shape = outputShapes[i];
             if (shape.empty()) {
@@ -302,8 +412,15 @@ void Executor::prepare() {
             if (!shape.empty()) {
                 auto tensor = std::make_unique<Tensor>(*ctx_, shape, DataType::FLOAT32, false);
                 outputTensors.push_back(tensor.get());
+                actualOutputNames.push_back(outputName);
                 intermediates_[outputName] = std::move(tensor);
                 producedValues.insert(outputName);
+                
+                // For SiLU fusion, also mark the original Conv output as produced
+                // (since some ops might reference it directly)
+                if (useSiluFusion && i == 0 && !siluOutputName.empty()) {
+                    producedValues.insert(node.outputs[0]);
+                }
             }
         }
 
@@ -318,6 +435,7 @@ void Executor::prepare() {
             prepared.inputs = inputTensors;
             prepared.outputs = outputTensors;
             prepared.node = &node;
+            prepared.outputNames = actualOutputNames;
             preparedOps_.push_back(std::move(prepared));
         } catch (const std::exception& e) {
             std::cout << "Warning: Failed to prepare " << node.opType << ": " << e.what() << std::endl;
@@ -371,7 +489,8 @@ void Executor::prepare() {
         }
         
         // Mark outputs as dirty and compute-written
-        for (const auto& outputName : prepared.node->outputs) {
+        // Use actualOutputNames (may differ from node->outputs for fused ops)
+        for (const auto& outputName : prepared.outputNames) {
             if (!outputName.empty()) {
                 dirtyTensors.insert(outputName);
                 computeWrittenTensors.insert(outputName);
@@ -433,6 +552,29 @@ double Executor::runTimed(std::map<std::string, Tensor>& inputs,
     }
 
     return timeMs;
+}
+
+std::map<std::string, double> Executor::runProfile(std::map<std::string, Tensor>& inputs) {
+    std::map<std::string, double> timings;
+    
+    // Count operators by type
+    std::map<std::string, int> opCounts;
+    for (const auto& prepared : preparedOps_) {
+        opCounts[prepared.node->opType]++;
+    }
+    
+    // Run full inference and get total time
+    std::map<std::string, Tensor*> outputs;
+    double totalMs = runTimed(inputs, outputs);
+    
+    std::cout << "\n=== Operator Counts ===" << std::endl;
+    for (const auto& [opType, count] : opCounts) {
+        std::cout << "  " << opType << ": " << count << std::endl;
+        timings[opType + "_count"] = count;
+    }
+    timings["total_ms"] = totalMs;
+    
+    return timings;
 }
 
 } // namespace onnxrt

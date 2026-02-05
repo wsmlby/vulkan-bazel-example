@@ -57,6 +57,10 @@ public:
     double runTimed(std::map<std::string, Tensor>& inputs,
                     std::map<std::string, Tensor*>& outputs);
 
+    // Run inference with per-operator profiling
+    // Returns a map of operator name/type -> time in milliseconds
+    std::map<std::string, double> runProfile(std::map<std::string, Tensor>& inputs);
+
 private:
     vkcompute::Context* ctx_;
     std::string shaderDir_;
@@ -77,6 +81,7 @@ private:
         std::vector<Tensor*> inputs;
         std::vector<Tensor*> outputs;
         const Node* node;
+        std::vector<std::string> outputNames;  // Actual output tensor names (may differ from node->outputs for fused ops)
     };
     std::vector<PreparedOp> preparedOps_;
 
