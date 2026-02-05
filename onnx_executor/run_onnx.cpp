@@ -53,9 +53,14 @@ LetterboxInfo yoloPreprocess(
         int srcChannel = bgrToRgb[c];  // Convert BGR input to RGB output
         for (int y = 0; y < info.newHeight; y++) {
             for (int x = 0; x < info.newWidth; x++) {
-                // Map to source coordinates
-                float srcX = x / info.scale;
-                float srcY = y / info.scale;
+                // Map to source coordinates using OpenCV INTER_LINEAR formula:
+                // src_coord = (dst_coord + 0.5) * (src_size / dst_size) - 0.5
+                float srcX = (x + 0.5f) / info.scale - 0.5f;
+                float srcY = (y + 0.5f) / info.scale - 0.5f;
+                
+                // Clamp to valid source coordinates
+                srcX = std::max(0.0f, std::min(srcX, (float)(srcWidth - 1)));
+                srcY = std::max(0.0f, std::min(srcY, (float)(srcHeight - 1)));
                 
                 int x0 = (int)srcX;
                 int y0 = (int)srcY;
@@ -168,17 +173,6 @@ std::vector<Detection> yoloPostprocess(
                   << " w=" << det[2] << " h=" << det[3] << " obj=" << det[4];
         for (int c = 0; c < numClasses; c++) {
             std::cout << " c" << c << "=" << det[5+c];
-        }
-        std::cout << std::endl;
-    }
-    
-    // Debug: check specific anchor to compare with Python (anchor 15739)
-    {
-        const float* det = output + 15739 * numValues;
-        std::cout << "  Anchor 15739: cx=" << det[0] << " cy=" << det[1] 
-                  << " w=" << det[2] << " h=" << det[3] << " obj=" << det[4];
-        for (int c = 0; c < numClasses; c++) {
-            std::cout << " c" << c << "=" << std::setprecision(6) << det[5+c];
         }
         std::cout << std::endl;
     }
